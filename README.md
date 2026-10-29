@@ -36,9 +36,20 @@ The script seeds NumPy's legacy global random generator (seed 42), which produce
 
 | Path | Purpose |
 |---|---|
+| `analysis.ipynb` | The analysis, executed with outputs (start here) |
+| `analysis.py` | The same notebook as plain text (jupytext), for readable diffs |
 | `loan_risk/data.py` | Load and validate the CSV; define the label (defaulted = 1, repaid = 0; ongoing loans have no label); stratified train/test split |
 | `loan_risk/features.py` | Engineered features, the model inputs for each employment variant, and the direction constraints |
-| `tests/` | Data-integrity, leakage and feature tests |
+| `loan_risk/eda.py` | Default rates with confidence intervals, decile-binned rates, and the ongoing-vs-resolved check |
+| `loan_risk/plots.py` | Shared chart style (colorblind-safe palette) and figure saving |
+| `figures/` | Charts referenced in this README |
+| `tests/` | Data-integrity, leakage, feature and helper tests |
+
+To regenerate the executed notebook from its source:
+
+```bash
+jupytext --to ipynb analysis.py && jupyter nbconvert --to notebook --execute --inplace analysis.ipynb
+```
 
 ## Tests
 
