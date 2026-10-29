@@ -14,12 +14,12 @@ from loan_risk.explain import (
     sigmoid,
 )
 from loan_risk.features import MISMATCH, NOT_PROVIDED, VERIFIED, tree_matrix
-from loan_risk.modeling import PRODUCTION_VARIANT, make_production_model
+from loan_risk.modeling import WORKING_VARIANT, make_production_model
 
 
 @pytest.fixture(scope="module")
 def setup(resolved, resolved_features):
-    X = tree_matrix(resolved_features, PRODUCTION_VARIANT)
+    X = tree_matrix(resolved_features, WORKING_VARIANT)
     model = make_production_model(X.columns).fit(X, default_label(resolved))
     return model, X, AdditiveExplainer(model, X)
 

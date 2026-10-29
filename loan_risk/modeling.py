@@ -17,9 +17,12 @@ from sklearn.preprocessing import StandardScaler
 from .data import SEED
 from .features import CATEGORICAL, MONOTONIC
 
-# Chosen in the notebook (section 4): employment left out of the model, and the additive model's
-# settings picked by the cross-validated grid search with the one-standard-error rule.
-PRODUCTION_VARIANT = "V3"
+# Sections 4-6 of the notebook use the variant without employment status (V3). The fairness analysis
+# (section 7) recommends adding back one "unemployed" flag (V2): equally accurate overall, and the
+# only variant that stays calibrated for unemployed applicants.
+WORKING_VARIANT = "V3"
+RECOMMENDED_VARIANT = "V2"
+# The additive model's settings, picked by the cross-validated grid search with the one-standard-error rule.
 ADDITIVE_GBM_PARAMS = {"learning_rate": 0.05, "max_leaf_nodes": 4, "min_samples_leaf": 50}
 METRICS = ["ROC-AUC", "PR-AUC", "log-loss", "Brier"]
 

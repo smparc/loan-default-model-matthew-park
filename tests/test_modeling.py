@@ -6,7 +6,7 @@ from loan_risk.data import default_label
 from loan_risk.features import CATEGORICAL, MONOTONIC, tree_matrix
 from loan_risk.modeling import (
     ADDITIVE_GBM_PARAMS,
-    PRODUCTION_VARIANT,
+    WORKING_VARIANT,
     cross_validate,
     cv_splits,
     make_additive_gbm,
@@ -18,7 +18,7 @@ from loan_risk.modeling import (
 
 @pytest.fixture(scope="module")
 def fitted(resolved, resolved_features):
-    X = tree_matrix(resolved_features, PRODUCTION_VARIANT)
+    X = tree_matrix(resolved_features, WORKING_VARIANT)
     return make_production_model(X.columns).fit(X, default_label(resolved)), X
 
 
@@ -31,7 +31,7 @@ def test_additive_model_settings(features):
 
 
 def test_production_model_uses_the_tuned_settings(features):
-    params = make_production_model(tree_matrix(features, PRODUCTION_VARIANT).columns).get_params()
+    params = make_production_model(tree_matrix(features, WORKING_VARIANT).columns).get_params()
     assert all(params[name] == value for name, value in ADDITIVE_GBM_PARAMS.items())
 
 

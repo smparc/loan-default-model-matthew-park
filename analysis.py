@@ -25,6 +25,7 @@
 # 4. Choosing the model: three candidates compared by cross-validation, tuning, features, calibration
 # 5. The model against the baseline: the untouched test set, robustness, and what deployment would change
 # 6. Explaining decisions: exact per-applicant reasons, what the model learned, what would change a decision
+# 7. Fairness across employment groups: who gets approved, who bears the errors, and what to do about it
 #
 # To re-run: `jupytext --to ipynb analysis.py && jupyter nbconvert --to notebook --execute --inplace analysis.ipynb`
 
@@ -44,7 +45,7 @@ from IPython.display import display
 from matplotlib.colors import LinearSegmentedColormap
 from scipy import stats
 from sklearn.metrics import roc_auc_score, roc_curve
-from statsmodels.stats.proportion import proportions_ztest
+from statsmodels.stats.proportion import proportion_confint, proportions_ztest
 
 from loan_risk import plots
 from loan_risk.baseline import (
@@ -83,7 +84,7 @@ from loan_risk.explain import (
     report,
     sigmoid,
 )
-from loan_risk.fairness import score_conditional_odds
+from loan_risk.fairness import group_outcomes, score_conditional_odds
 from loan_risk.features import (
     CANDIDATE_FEATURES,
     EMPLOYMENT_VARIANTS,
@@ -101,7 +102,7 @@ from loan_risk.features import (
 )
 from loan_risk.modeling import (
     ADDITIVE_GBM_PARAMS,
-    PRODUCTION_VARIANT,
+    WORKING_VARIANT,
     cross_validate,
     cv_splits,
     make_additive_gbm,
@@ -742,7 +743,7 @@ print(f"Development set: {len(train_rows):,} loans ({y_dev.mean():.1%} defaulted
 #   tests whether interactions or unconstrained shapes add anything.
 
 # %%
-core_tree, core_linear = tree_matrix(features, PRODUCTION_VARIANT), linear_matrix(features, PRODUCTION_VARIANT)
+core_tree, core_linear = tree_matrix(features, WORKING_VARIANT), linear_matrix(features, WORKING_VARIANT)
 candidates = {
     "M1: logistic regression": (make_logistic, core_linear),
     "M2: additive GBM, direction-constrained": (make_additive_gbm, core_tree),
@@ -852,7 +853,7 @@ assert chosen_setting == setting_name(ADDITIVE_GBM_PARAMS), "update ADDITIVE_GBM
 # %%
 feature_sets = {"Core five (selected)": core_tree}
 for extra in CANDIDATE_FEATURES:
-    feature_sets[f"+ {FEATURE_LABELS[extra].lower()}"] = tree_matrix(features, PRODUCTION_VARIANT, (extra,))
+    feature_sets[f"+ {FEATURE_LABELS[extra].lower()}"] = tree_matrix(features, WORKING_VARIANT, (extra,))
 for name, alternative in loan_to_income_alternatives(resolved).items():
     if name != "stated income":
         feature_sets[f"loan / income using {name}"] = core_tree.assign(loan_to_income=alternative.to_numpy())
@@ -896,7 +897,7 @@ save_table(variant_summary, "models_employment_variants")
 # matters when probabilities drive thresholds, pricing or expected-loss estimates.
 
 # %%
-selected_cv = variant_cv[PRODUCTION_VARIANT]
+selected_cv = variant_cv[WORKING_VARIANT]
 platt_cv = cross_validate(make_platt_calibrated, dev(core_tree), y_dev, splits)
 display(summarize({"Selected model": selected_cv.fold_metrics,
                    "Selected model + Platt scaling": platt_cv.fold_metrics}).round(4))
@@ -940,8 +941,9 @@ print(f"Average predicted probability {oof.mean():.1%} vs observed default rate 
 # ### 4.6 The choice
 #
 # The production model is **M2: additive gradient boosting with direction constraints** (learning
-# rate 0.05, 4 leaves, at least 50 loans per leaf) on the five core features, without employment
-# status and without recalibration.
+# rate 0.05, 4 leaves, at least 50 loans per leaf) on the five core features, without recalibration.
+# Sections 5 and 6 use the working version without employment status; section 7 decides whether to
+# add an employment input back.
 # - **It wins on the rule set in advance:** lowest cross-validated log-loss, better than the rules in
 #   all 15 folds, about 95% of the possible AUC gain.
 # - **It is interpretable by design:** every prediction is a sum of five per-feature contributions,
@@ -1352,6 +1354,7 @@ explanation = shap.Explanation(
     data=core_tree.to_numpy(dtype=float),
     feature_names=[FEATURE_LABELS[c] for c in core_tree.columns],
 )
+np.random.seed(0)  # shap shuffles the dots randomly; a fixed seed keeps the figure reproducible
 shap.plots.beeswarm(explanation, show=False, color=value_cmap)
 fig = plt.gcf()
 fig.set_size_inches(8, 3.8)
@@ -1474,4 +1477,293 @@ plt.show()
 # - **The whole model fits on one page.** Five learned curves plus a constant (figure 9) are the entire
 #   model. That makes it as inspectable as the rule rubric, and it was learned from outcomes rather than
 #   set by hand.
-# - **Employment status is not an input** (section 7 explains why), so it never appears as a reason.
+# - **Employment in the reasons.** The working model has no employment input, so employment never
+#   appears as a reason. Section 7 recommends adding one flag for unemployed applicants; it would then
+#   appear as a reason for them, as employment-related reasons already do in standard adverse-action
+#   reason lists (for example, "temporary or irregular employment").
+
+# %% [markdown]
+# ## 7. Fairness across employment groups
+#
+# The brief asks three things:
+# - does the model replicate the rules' bias against self-employed applicants, correct it, or
+#   introduce new biases;
+# - what the approval and default rates are for each group, under the baseline and the model;
+# - what to do about any bias found.
+#
+# Everything here uses the out-of-fold scores for all 1,836 resolved loans at today's volumes
+# (section 5.4), because the test set holds only 46 unemployed applicants. The comparison includes the
+# three ways of using employment (V1: all three groups, V2: an "unemployed" flag only, V3: nothing),
+# the patched rules, the straight-line logistic regression, and the oracle, which shows what pricing
+# every applicant at their true risk would look like.
+
+# %%
+variant_oof = {"V3": oof_all}
+for variant in ("V1", "V2"):
+    variant_oof[variant] = cross_validate(make_production_model, tree_matrix(features, variant), y,
+                                          portfolio_splits).mean_oof
+linear_oof = cross_validate(make_logistic, linear_matrix(features, "V1"), y, portfolio_splits).mean_oof
+employment = resolved["employment_status"].to_numpy()
+fair_systems = {
+    "Rules as they are": (rule_decisions, None),
+    "Patched rules (patch 2)": (portfolio_tiers["Patched rules (patch 2)"], None),
+    "Model, no employment (V3)": (portfolio_tiers["Model"], oof_all),
+    "Model + unemployed flag (V2)": (matched_tiers(variant_oof["V2"], n_approve, n_deny), variant_oof["V2"]),
+    "Model, all three groups (V1)": (matched_tiers(variant_oof["V1"], n_approve, n_deny), variant_oof["V1"]),
+    "Logistic regression (M1, V1)": (matched_tiers(linear_oof, n_approve, n_deny), linear_oof),
+    "Oracle (ceiling, diagnostic only)": (portfolio_tiers["Oracle (ceiling, diagnostic only)"], oracle_p),
+}
+group_tables = {name: group_outcomes(y, tiers, employment, EMPLOYMENT_GROUPS, p=p)
+                for name, (tiers, p) in fair_systems.items()}
+save_table(pd.concat(group_tables), "fairness_group_outcomes")
+
+# %% [markdown]
+# ### 7.1 The ground truth
+
+# %%
+truth = rate_table(y, employment, EMPLOYMENT_GROUPS)
+p_vs_employed = {group: proportions_ztest(truth.loc[[group, "employed"], "defaults"], truth.loc[[group, "employed"], "n"])[1]
+                 for group in ["self_employed", "unemployed"]}
+display(format_rates(truth).assign(**{"p-value vs employed": pd.Series(p_vs_employed)}).rename(index=GROUP_LABELS))
+
+# %% [markdown]
+# Self-employed applicants default about as often as employed ones (29.0% vs 27.2%, p = 0.45).
+# Unemployed applicants default far more often (46.7%, p < 0.001). That difference is real, and a fair
+# system should reflect it, as long as it prices it correctly.
+
+# %% [markdown]
+# ### 7.2 Approval and default rates by group, baseline vs model
+
+# %%
+brief_columns = ["applicants", "default rate", "auto-approved", "approval ratio", "sent to review", "denied",
+                 "default rate among approved"]
+display(pd.concat({name: group_tables[name][brief_columns]
+                   for name in ["Rules as they are", "Model, no employment (V3)"]}).rename(index=GROUP_LABELS, level=1).round(3))
+error_columns = ["good applicants denied", "good applicants not auto-approved", "defaults auto-approved"]
+display(pd.concat({name: group_tables[name][error_columns]
+                   for name in ["Rules as they are", "Model, no employment (V3)", "Oracle (ceiling, diagnostic only)"]})
+        .rename(index=GROUP_LABELS, level=1).round(3))
+
+# %%
+markers = {
+    "Rules as they are": (plots.RULES_COLOR, "o"),
+    "Model, no employment (V3)": (plots.MODEL_COLOR, "o"),
+    "Model + unemployed flag (V2)": (plots.ORANGE, "o"),
+    "Oracle (ceiling, diagnostic only)": (plots.INK, "D"),
+}
+measures = {
+    "auto-approved": "Auto-approved",
+    "good applicants denied": "Good applicants wrongly denied",
+    "default rate among approved": "Default rate among approved",
+}
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.6), sharey=True)
+rows = np.arange(len(EMPLOYMENT_GROUPS))[::-1]
+for ax, (column, title) in zip(axes, measures.items()):
+    for offset, (name, (color, marker)) in zip(np.linspace(0.24, -0.24, len(markers)), markers.items()):
+        values = group_tables[name].loc[EMPLOYMENT_GROUPS, column].to_numpy()
+        hollow = marker == "D"
+        ax.scatter(values, rows + offset, s=46, marker=marker, color="none" if hollow else color,
+                   edgecolor=color if hollow else plots.SURFACE, linewidth=1.5 if hollow else 1, label=name, zorder=3)
+    ax.set_title(title)
+    ax.set_xlim(left=0)
+    plots.percent_axis(ax, "x")
+    ax.grid(axis="x", visible=True)
+    ax.grid(axis="y", visible=False)
+axes[0].set_yticks(rows, [GROUP_LABELS[g] for g in EMPLOYMENT_GROUPS])
+axes[0].tick_params(axis="y", length=0)
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=8.5, frameon=False)
+fig.tight_layout(rect=(0, 0.08, 1, 1))
+plots.save(fig, "fig12_fairness_by_group")
+plt.show()
+
+# %% [markdown]
+# - **The model corrects the bias against self-employed applicants.** The rules auto-approve 36% of
+#   them against 60% of employed applicants (approval ratio 0.60). The model approves 46% against 52%
+#   (0.89), close to the 0.93 that true risk would justify. Good self-employed applicants wrongly denied
+#   fall from 12% to 9%.
+# - **The model is far less harsh on creditworthy unemployed applicants.** The rules wrongly deny 45%
+#   of unemployed applicants who would have repaid; the model denies 12%, about what true risk would
+#   (13%).
+# - **But without employment information the model over-approves unemployed applicants.** It
+#   auto-approves 15% of them, where true risk would justify 5.5%, and 37% of those it approves
+#   default, against 14-15% for the other groups. That is a new problem, examined next.
+
+# %% [markdown]
+# ### 7.3 Does any score mis-price a group?
+#
+# The same test as in section 3.4: once a system's score is known, does employment group still
+# predict default? An odds ratio above 1 means the score understates that group's risk; below 1, it
+# overstates it.
+
+# %%
+conditional = {}
+for name, (_, p) in fair_systems.items():
+    if name == "Rules as they are":
+        score = resolved["rule_based_score"].to_numpy() / 10
+    elif name == "Patched rules (patch 2)":
+        score = -patched_risk / 10
+    else:
+        score = np.log(p / (1 - p))
+    result = score_conditional_odds(y, score, employment, order=EMPLOYMENT_GROUPS)
+    conditional[name] = {f"{GROUP_LABELS[g]}: {column}": result.loc[g, column]
+                         for g in result.index for column in ["odds ratio", "p-value"]}
+conditional = pd.DataFrame.from_dict(conditional, orient="index")
+display(conditional.round(3))
+save_table(conditional, "fairness_score_conditional")
+understated = pd.DataFrame({name: 100 * (group_tables[name]["default rate"] - group_tables[name]["mean predicted risk"])
+                            for name, (_, p) in fair_systems.items() if p is not None}).T
+display(understated.rename(columns=GROUP_LABELS).round(1).add_suffix(": risk understated by (pts)"))
+
+# %% [markdown]
+# - **Every model variant, and the patched rules, prices self-employed applicants correctly** (odds
+#   ratios 0.99-1.01, against 0.67 for the original rules). The penalty is gone.
+# - **Without employment (V3), the model understates unemployed applicants' risk** by about 6 points
+#   (40.9% predicted, 46.7% actual; odds ratio 1.34, p = 0.10). That is why it over-approves them. With
+#   the unemployed flag (V2) the gap halves, to about 3 points (odds ratio 1.14, p = 0.46).
+
+# %% [markdown]
+# ### 7.4 Keep employment, drop it, or narrow it?
+
+# %%
+unemployed = employment == "unemployed"
+variant_rows = {}
+for name in ["Model, all three groups (V1)", "Model + unemployed flag (V2)", "Model, no employment (V3)",
+             "Oracle (ceiling, diagnostic only)"]:
+    tiers, p = fair_systems[name]
+    approved_unemployed = unemployed & (tiers == "approve")
+    variant_rows[name] = {
+        "ROC-AUC": roc_auc_score(y, p),
+        "log-loss": probability_metrics(y, p)["log-loss"],
+        "defaults auto-approved": int(y[tiers == "approve"].sum()),
+        "good applicants denied": int((1 - y)[tiers == "deny"].sum()),
+        "self-employed approval ratio": group_tables[name].loc["self_employed", "approval ratio"],
+        "unemployed approval ratio": group_tables[name].loc["unemployed", "approval ratio"],
+        "unemployed approved": int(approved_unemployed.sum()),
+        "...of whom defaulted": int(y[approved_unemployed].sum()),
+        "unemployed risk understated by (pts)": understated.loc[name, "unemployed"],
+    }
+variant_comparison = pd.DataFrame.from_dict(variant_rows, orient="index")
+display(variant_comparison.round(3))
+save_table(variant_comparison, "fairness_variants")
+extra = unemployed & (fair_systems["Model, no employment (V3)"][0] == "approve") & (
+    fair_systems["Model + unemployed flag (V2)"][0] != "approve")
+low, high = proportion_confint(y[extra].sum(), extra.sum(), method="wilson")
+print(f"Unemployed applicants approved without the flag (V3) but not with it (V2): {extra.sum()}; "
+      f"{y[extra].sum()} of them defaulted ({y[extra].mean():.0%}, 95% CI {low:.0%}-{high:.0%})")
+print(f"Unemployed applicants asking for a loan above 30% of stated income: "
+      f"{(features.loc[unemployed, 'loan_to_income'] > 0.3).mean():.0%} "
+      f"(employed: {(features.loc[employment == 'employed', 'loan_to_income'] > 0.3).mean():.0%})")
+
+# %% [markdown]
+# - **Overall, the three variants are equally accurate** (AUC 0.738-0.739). V2 is marginally ahead:
+#   127 defaults auto-approved and 96 good applicants denied, against 128 and 98 without employment
+#   (V3).
+# - **They treat self-employed applicants the same way** (approval ratio 0.89-0.92).
+# - **They differ only for unemployed applicants.** Without the flag (V3), the model approves 27 of
+#   them where true risk justifies 10. The 14 it approves that the flagged model (V2) doesn't default
+#   at 50% (95% CI 27-73%). With the flag, 13 are approved, close to the oracle's 10.
+# - **Most of the unemployed gap is affordability, not the label.** 91% of unemployed applicants ask
+#   for a loan above 30% of their stated income, against 43% of employed applicants. That is a
+#   legitimate, measured reason to approve fewer of them.
+#
+# Aggregate accuracy couldn't tell these variants apart (section 4.4). Only the group-level
+# comparison against true risk shows what dropping employment actually does.
+
+# %% [markdown]
+# ### 7.5 Removing a column doesn't remove the information
+
+# %%
+proxy_rows = {}
+for positive, negative in [("self_employed", "employed"), ("unemployed", "employed")]:
+    keep = np.isin(employment, [positive, negative])
+    proxy_rows[f"{GROUP_LABELS[positive]} vs {GROUP_LABELS[negative].lower()}, from the model's five inputs"] = \
+        adversarial_auc(core_tree[keep], employment[keep] == positive)
+keep = np.isin(employment, ["self_employed", "employed"])
+proxy_rows["Self-employed vs employed, from deposit consistency alone (not a model input)"] = \
+    adversarial_auc(features.loc[keep, ["bank_has_consistent_deposits"]], employment[keep] == "self_employed")
+display(pd.DataFrame.from_dict(proxy_rows, orient="index").round(3))
+display(all_contributions.groupby(employment).mean().reindex(EMPLOYMENT_GROUPS)
+        .rename(index=GROUP_LABELS, columns=FEATURE_LABELS).round(2))
+
+# %% [markdown]
+# - **Unemployment is easy to infer from the model's inputs** (AUC 0.82-0.86), mainly through income
+#   and loan ÷ income. Dropping the employment column doesn't stop the model reacting to unemployment.
+#   It reacts through proxies, and less accurately, which is the miscalibration in section 7.3. On
+#   average, unemployed applicants' loan ÷ income contribution is far higher than other groups', so
+#   affordability already carries most of their extra risk.
+# - **Self-employment is not inferable from the inputs** (AUC 0.51-0.54, close to chance). So the model
+#   can't penalize self-employed applicants indirectly either.
+# - **Deposit consistency would have been a proxy** (AUC 0.69 on its own) while carrying no risk
+#   signal (section 2.3). Leaving it out was right, and the rubric's use of it is a second, hidden
+#   self-employment penalty.
+
+# %% [markdown]
+# ### 7.6 Does the model introduce new biases?
+
+# %%
+denied_good = pd.DataFrame({name: group_tables[name]["good applicants denied"] for name in [
+    "Rules as they are", "Patched rules (patch 2)", "Logistic regression (M1, V1)", "Model, no employment (V3)",
+    "Model + unemployed flag (V2)", "Oracle (ceiling, diagnostic only)"]}).T
+display((100 * denied_good).rename(columns=GROUP_LABELS).round(1).add_suffix(": good applicants denied (%)"))
+print("Share without income documents: " + ", ".join(
+    f"{GROUP_LABELS[g]} {(features.loc[employment == g, 'income_verification'] == NOT_PROVIDED).mean():.1%}"
+    for g in EMPLOYMENT_GROUPS))
+
+# %% [markdown]
+# - **Dropping employment over-approves unemployed applicants** (V3, section 7.4). That is the main new
+#   bias, in the opposite direction from the rules.
+# - **Model form matters.** The straight-line logistic regression wrongly denies 27% of good
+#   unemployed applicants, twice what true risk implies (13%), because it extends the loan-to-income
+#   effect in a straight line where the true effect levels off. The additive model doesn't (12-16%).
+# - **The patched rules fix the self-employment penalty but keep the unemployment one.** They wrongly
+#   deny 48% of good unemployed applicants.
+# - **The heavy weight on missing documents doesn't fall unevenly:** 14-15% of employed and
+#   self-employed applicants have none, and 9% of unemployed.
+
+# %% [markdown]
+# ### 7.7 Fairness criteria conflict
+#
+# Three common fairness criteria pull in different directions:
+# - **equal approval rates** across groups;
+# - **equal error rates**, for example the same share of good applicants wrongly denied in every group;
+# - **calibration**: the same predicted risk means the same actual risk in every group.
+#
+# When groups truly default at different rates, no score can satisfy all three at once (Kleinberg et
+# al. 2016; Chouldechova 2017). For employed and self-employed applicants, whose default rates match,
+# the model comes close on all three. For unemployed applicants it can't: equal approval rates would
+# mean approving many loans that won't be repaid. I put calibration first, so that a risk score means
+# the same thing for everyone, and judge approval gaps and error rates against what pricing everyone at
+# their true risk would produce (the oracle).
+
+# %% [markdown]
+# ### 7.8 Recommendation
+#
+# 1. **Remove the self-employment penalty.** The rules overstate self-employed risk (odds ratio 0.67).
+#    Every model variant prices it correctly (0.99-1.01) and lifts the self-employed approval ratio
+#    from 0.60 to about 0.9, close to the 0.93 true risk justifies. There is no trade-off here.
+# 2. **For unemployment, use one narrow flag (V2) rather than dropping it.** Unemployed applicants
+#    really are riskier, and most of the gap is affordability, which the model already measures.
+#    Dropping the flag (V3) doesn't remove the information. It makes the model understate their risk
+#    by about 6 points and approve 27 where true risk justifies 10, and the extra approvals default at
+#    about 50%. That is lending people money they can't repay, not fairness. The flag keeps every group
+#    calibrated, matches true-risk approvals closely (13 vs 10), treats self-employed applicants exactly
+#    like employed ones, and costs nothing in accuracy.
+# 3. **Conditions.** Employment status, or source of income, is a protected or sensitive ground in
+#    some places. Examples: "social condition" in Quebec, "source of income" in several provinces, and
+#    receipt of public assistance under the US Equal Credit Opportunity Act. So compliance has to sign
+#    off. If the flag can't be used, fall back to V3 and watch the default rate of approved unemployed
+#    applicants closely. Either way, the longer-term fix is to replace the label with direct evidence of
+#    repayment capacity, such as verified benefit or other income.
+# 4. **What not to do.** Separate approval thresholds per group means treating groups differently on
+#    purpose, which fair-lending rules generally prohibit. Reweighting the training data to equalize
+#    approval rates would push the model further from true risk for unemployed applicants: the same
+#    failure as V3.
+# 5. **Keep measuring.** Collect employment status even when the model doesn't use it. Report
+#    approval rates, wrongly-denied rates and calibration by group every month, and alert when a
+#    group's approval ratio drops below 0.8 without a matching difference in risk.
+# 6. **Who decides:** compliance and the credit-risk committee. My job is to put the trade-off in front
+#    of them in numbers.
+#
+# Sections 4-6 used V3 as the working model. V2 performs the same overall (section 7.4), so those
+# results carry over; the differences are the group-level ones shown here.

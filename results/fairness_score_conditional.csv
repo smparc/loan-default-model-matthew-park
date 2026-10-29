@@ -1,0 +1,8 @@
+,Self-employed: odds ratio,Self-employed: p-value,Unemployed: odds ratio,Unemployed: p-value
+Rules as they are,0.6672,0.0015,0.7536,0.1329
+Patched rules (patch 2),1.0104,0.9326,0.8255,0.2993
+"Model, no employment (V3)",0.9943,0.9635,1.3395,0.0964
+Model + unemployed flag (V2),1.0002,0.9988,1.1404,0.4597
+"Model, all three groups (V1)",1.0113,0.9282,1.1466,0.4412
+"Logistic regression (M1, V1)",1.0065,0.9578,1.0261,0.8869
+"Oracle (ceiling, diagnostic only)",1.016,0.8995,1.0384,0.833

@@ -1,0 +1,5 @@
+,ROC-AUC,log-loss,defaults auto-approved,good applicants denied,self-employed approval ratio,unemployed approval ratio,unemployed approved,...of whom defaulted,unemployed risk understated by (pts)
+"Model, all three groups (V1)",0.7387,0.5292,129,96,0.9188,0.1371,13,3,2.8756
+Model + unemployed flag (V2),0.7389,0.5291,127,96,0.8989,0.1361,13,3,2.8204
+"Model, no employment (V3)",0.7382,0.5294,128,98,0.8911,0.2867,27,10,5.8193
+"Oracle (ceiling, diagnostic only)",0.7412,0.5246,123,95,0.9289,0.1054,10,2,0.3743
