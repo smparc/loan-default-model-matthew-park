@@ -24,16 +24,24 @@
 # 3. The rule-based baseline: how well it ranks risk, what its decisions cost, and whether it is fair
 # 4. Choosing the model: three candidates compared by cross-validation, tuning, features, calibration
 # 5. The model against the baseline: the untouched test set, robustness, and what deployment would change
+# 6. Explaining decisions: exact per-applicant reasons, what the model learned, what would change a decision
 #
 # To re-run: `jupytext --to ipynb analysis.py && jupyter nbconvert --to notebook --execute --inplace analysis.ipynb`
 
 # %%
+import warnings
+
+# shap imports tqdm, which warns when Jupyter progress widgets aren't installed; the warning is noise here.
+warnings.filterwarnings("ignore", message="IProgress not found")
+
 from functools import partial
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import shap
 from IPython.display import display
+from matplotlib.colors import LinearSegmentedColormap
 from scipy import stats
 from sklearn.metrics import roc_auc_score, roc_curve
 from statsmodels.stats.proportion import proportions_ztest
@@ -42,6 +50,7 @@ from loan_risk import plots
 from loan_risk.baseline import (
     adjusted_rule_score,
     oracle_default_probability,
+    oracle_log_odds_terms,
     rebuild_rule_score,
     rule_components,
     rule_tiers,
@@ -66,14 +75,25 @@ from loan_risk.evaluation import (
     swap_sets,
     tier_table,
 )
+from loan_risk.explain import (
+    AdditiveExplainer,
+    decision_for,
+    largest_approvable_loan,
+    probability_with,
+    report,
+    sigmoid,
+)
 from loan_risk.fairness import score_conditional_odds
 from loan_risk.features import (
     CANDIDATE_FEATURES,
     EMPLOYMENT_VARIANTS,
     FEATURE_LABELS,
     INCOME_VERIFICATION_LABELS,
+    MISMATCH,
     MISMATCH_THRESHOLD,
+    NOT_PROVIDED,
     VARIANT_DESCRIPTIONS,
+    VERIFIED,
     build_features,
     linear_matrix,
     loan_to_income_alternatives,
@@ -1193,3 +1213,265 @@ plt.show()
 # - **Recommendation:** replace the rules with the model, starting in shadow mode. If something has to
 #   ship before the model is approved, the two-line rules patch delivers most of the fairness gain and
 #   part of the accuracy gain immediately.
+
+# %% [markdown]
+# ## 6. Explaining decisions
+#
+# The model is additive: its log-odds of default are a constant plus one learned contribution per
+# feature. So every prediction splits exactly into a typical applicant's risk plus five
+# contributions, with nothing left over. For an additive model these contributions are also exactly
+# the SHAP values, so no approximation is involved. Explanations use the production model trained in
+# section 5, with the development set as the reference population.
+#
+# ### 6.1 Exact contributions and decision cutoffs
+
+# %%
+explainer = AdditiveExplainer(final_model, dev(core_tree))
+all_contributions = explainer.contributions(core_tree)
+gap = np.abs(explainer.base_value + all_contributions.sum(axis=1) - final_model.decision_function(core_tree)).max()
+print(f"Largest gap between (base value + contributions) and the model's own log-odds: {gap:.1e}")
+approve_below = float(np.quantile(oof_all, n_approve / len(y)))
+deny_at = float(np.quantile(oof_all, 1 - n_deny / len(y)))
+typical_risk = float(sigmoid(explainer.base_value))
+print(f"Cutoffs that reproduce today's volumes: auto-approve below {approve_below:.1%} predicted risk, "
+      f"deny at {deny_at:.1%} or more. Applicant with typical values on every factor: {typical_risk:.1%}.")
+
+# %% [markdown]
+# ### 6.2 What the model learned, compared with the truth
+#
+# Each panel shows a feature's learned contribution to the log-odds of default (blue) next to the
+# generator's true effect (gray), both relative to a typical applicant. The true effects come from the
+# data generator and are used only as a check, never for training.
+
+# %%
+truth_offset = oracle_log_odds_terms(dev(resolved)).mean()
+true_effect = {
+    "loan_to_income": lambda v: 1.25 * (np.asarray(v) > 0.3),
+    "bank_ending_balance": lambda v: 0.5 * (np.asarray(v) < 500),
+    "withdrawal_to_deposit": lambda v: 0.5 * (np.asarray(v) > 0.8),
+    "income_verification": lambda v: 1.25 * (np.asarray(v) != VERIFIED),
+    "bank_has_overdrafts": lambda v: 1.0 * np.asarray(v),
+}
+grids = {
+    "loan_to_income": np.geomspace(0.03, 5, 400),
+    "bank_ending_balance": np.linspace(0, 8000, 400),
+    "withdrawal_to_deposit": np.linspace(0.30, 0.95, 400),
+}
+levels = {
+    "income_verification": ([VERIFIED, MISMATCH, NOT_PROVIDED], ["Verified", "Mismatch", "Not provided"]),
+    "bank_has_overdrafts": ([0, 1], ["No overdrafts", "Overdrafts"]),
+}
+fig, axes = plt.subplots(2, 3, figsize=(11.5, 6.2))
+effect_axes = list(axes[0]) + list(axes[1][:2])
+for ax, column in zip(axes[0], grids):
+    grid = grids[column]
+    ax.plot(grid, true_effect[column](grid) - truth_offset[column], color=plots.INK_SECONDARY, linewidth=1,
+            label="generator's true effect")
+    ax.plot(grid, explainer.effect(column, grid), color=plots.MODEL_COLOR, linewidth=2, label="learned by the model")
+    ax.set_title(FEATURE_LABELS[column])
+axes[0][0].set_xscale("log")
+axes[0][0].set_xticks([0.05, 0.1, 0.3, 1, 3], ["5%", "10%", "30%", "100%", "300%"])
+axes[0][0].minorticks_off()
+plots.dollar_axis(axes[0][1])
+plots.percent_axis(axes[0][2], "x")
+axes[0][0].legend(loc="upper left", fontsize=8)
+for ax, (column, (values, labels)) in zip(axes[1], levels.items()):
+    x = np.arange(len(values))
+    ax.scatter(x - 0.08, true_effect[column](values) - truth_offset[column], s=50, color=plots.INK_SECONDARY, zorder=3)
+    ax.scatter(x + 0.08, explainer.effect(column, values), s=60, color=plots.MODEL_COLOR, edgecolor=plots.SURFACE,
+               linewidth=1.5, zorder=4)
+    ax.set_xticks(x, labels)
+    ax.set_xlim(-0.6, len(values) - 0.4)
+    ax.tick_params(axis="x", length=0)
+    ax.set_title(FEATURE_LABELS[column])
+low = min(ax.get_ylim()[0] for ax in effect_axes)
+high = max(ax.get_ylim()[1] for ax in effect_axes)
+for ax in effect_axes:
+    ax.set_ylim(low, high)
+    ax.axhline(0, color=plots.AXIS, linewidth=1, zorder=0)
+axes[0][0].set_ylabel("contribution to log-odds")
+axes[1][0].set_ylabel("contribution to log-odds")
+importance = all_contributions.abs().mean().sort_values()
+axes[1][2].barh([FEATURE_LABELS[c] for c in importance.index], importance.to_numpy(), height=0.45, color=plots.MODEL_COLOR)
+axes[1][2].set_title("Average size of each contribution")
+axes[1][2].set_xlabel("mean |contribution| (log-odds)")
+axes[1][2].grid(axis="x", visible=True)
+axes[1][2].grid(axis="y", visible=False)
+axes[1][2].tick_params(axis="y", length=0)
+fig.tight_layout()
+plots.save(fig, "fig9_learned_effects")
+plt.show()
+display(importance.sort_values(ascending=False).rename(index=FEATURE_LABELS).rename("mean |contribution| (log-odds)")
+        .round(3).to_frame())
+for column, grid in grids.items():
+    effect = explainer.effect(column, grid)
+    step = int(np.argmax(np.abs(np.diff(effect))))
+    print(f"{FEATURE_LABELS[column]}: largest learned step between {grid[step]:,.3g} and {grid[step + 1]:,.3g} "
+          f"({effect[step + 1] - effect[step]:+.2f}); total range {np.ptp(effect):.2f} log-odds")
+for column, (values, labels) in levels.items():
+    effect = explainer.effect(column, values)
+    truth = true_effect[column](values) - truth_offset[column]
+    print(f"{FEATURE_LABELS[column]}: " + ", ".join(
+        f"{label} {learned:+.2f} (true {true:+.2f})" for label, learned, true in zip(labels, effect, truth)))
+
+# %% [markdown]
+# **The strong effects are recovered precisely, the weak ones only roughly.**
+# - **Loan ÷ income:** the model found the generator's threshold (the jump happens at 29.5% of
+#   income; the truth is 30%) and roughly its size. Beyond about 70% of income it adds more risk,
+#   which the truth doesn't. Very large loans relative to income are mostly taken by low-income,
+#   often unemployed applicants, so this tail partly stands in for employment status, which the model
+#   doesn't see (section 7 returns to this).
+# - **Income verification and overdrafts:** close to the true effects (for example, "no documents"
+#   +1.05 vs +1.03 true; overdrafts +0.96 vs +0.83).
+# - **Bank balance:** right direction and roughly right size, but the step is blurred (around $1,300
+#   instead of $500) and there is an extra one near $4,400.
+# - **Withdrawals ÷ deposits:** rises above about 80% as it should. It also has one artifact:
+#   applicants withdrawing under 34% of their deposits get a large risk reduction (-0.66) that the true
+#   process doesn't have. About 80 training loans in that range happened to default less.
+#
+# I tested two fixes. Requiring at least 100 loans per leaf removes the pocket at no cost in accuracy
+# (cross-validated log-loss 0.5338 vs 0.5341). But then a cross-validation training fold can no
+# longer single out a group as small as the unemployed (about 90 applicants), which the employment
+# comparisons need. Bagging (averaging 10 models fitted to resampled data) didn't remove it. A pocket
+# of 80 noisy loans and a real group of 90 look the same to any regularizer; only more data separates
+# them. So the artifact is disclosed rather than tuned away, and it's the first thing I'd revisit with
+# more data. The weak features are also why only contributions of at least 0.10 log-odds are given as
+# reasons.
+
+# %% [markdown]
+# ### 6.3 All applicants at once
+#
+# Each dot is one applicant's contribution from one feature (the exact SHAP value), coloured by the
+# feature's value: darker means higher.
+
+# %%
+value_cmap = LinearSegmentedColormap.from_list("feature value", ["#86b6ef", "#0d366b"])
+explanation = shap.Explanation(
+    values=all_contributions.to_numpy(),
+    base_values=np.full(len(core_tree), explainer.base_value),
+    data=core_tree.to_numpy(dtype=float),
+    feature_names=[FEATURE_LABELS[c] for c in core_tree.columns],
+)
+shap.plots.beeswarm(explanation, show=False, color=value_cmap)
+fig = plt.gcf()
+fig.set_size_inches(8, 3.8)
+fig.axes[0].set_xlabel("contribution to log-odds of default")
+fig.axes[0].set_title("Contribution of each feature, for every applicant", loc="left")
+plots.save(fig, "fig10_contributions_beeswarm")
+plt.show()
+
+# %% [markdown]
+# Loan ÷ income spreads applicants furthest apart, from about -0.7 to +1.0 log-odds, followed by
+# income verification and overdrafts. Balance and withdrawals mostly nudge risk, apart from the
+# low-withdrawal pocket discussed above.
+
+# %% [markdown]
+# ### 6.4 Explaining individual applicants
+#
+# `explain_applicant` gives a reviewer:
+# - the decision and the predicted risk;
+# - the reasons, ranked by size, each with the risk the applicant would have if that factor were
+#   typical;
+# - what would change the decision.
+#
+# The four examples below come from the test set, so none was used to train the model: a typical
+# auto-approval, a typical review case, a typical denial, and a self-employed applicant the rules held
+# back but the model approves.
+
+# %%
+def explain_applicant(applicant_id: str) -> str:
+    """Reviewer-facing explanation of the model's decision for one applicant."""
+    position = int(np.flatnonzero(resolved["applicant_id"].to_numpy() == applicant_id)[0])
+    row, applicant = core_tree.iloc[[position]], resolved.iloc[position]
+    probability, reasons = explainer.explain(row)
+    lines = [report(applicant_id, probability, reasons, approve_below, deny_at, typical_risk)]
+    if probability >= approve_below:
+        changes = []
+        loan = largest_approvable_loan(explainer, row, applicant["stated_monthly_income"], approve_below)
+        if loan is not None and loan < applicant["loan_amount"]:
+            changes.append(f"a loan of ${loan:,} instead of ${applicant['loan_amount']:,} would be auto-approved")
+        if row["income_verification"].iloc[0] != VERIFIED:
+            verified = probability_with(explainer, row, income_verification=VERIFIED)
+            changes.append(f"with verified income documents, risk would be {verified:.0%} "
+                           f"({decision_for(verified, approve_below, deny_at)})")
+        lines.append("  What would change the decision: "
+                     + ("; ".join(changes) if changes else "no smaller loan or document alone is enough"))
+    lines.append(f"  For comparison, the rules: {applicant['rule_based_decision'].replace('_', ' ')} "
+                 f"(score {applicant['rule_based_score']:.1f}; applicant is {GROUP_LABELS[applicant['employment_status']].lower()})")
+    return "\n".join(lines)
+
+
+test_ids = resolved["applicant_id"].to_numpy()[test_rows]
+test_decision = np.where(p_test < approve_below, "approve", np.where(p_test >= deny_at, "deny", "review"))
+examples = {}
+for tier, label in [("approve", "typical auto-approval"), ("review", "typical review case"), ("deny", "typical denial")]:
+    members = np.flatnonzero(test_decision == tier)
+    examples[label] = test_ids[members[np.argmin(np.abs(p_test[members] - np.median(p_test[members])))]]
+flipped = np.flatnonzero((resolved["employment_status"].to_numpy()[test_rows] == "self_employed")
+                         & (test_rule_tiers != "approve") & (test_decision == "approve"))
+examples["self-employed: held back by the rules, approved by the model"] = test_ids[
+    flipped[np.argmax(resolved["rule_based_score"].to_numpy()[test_rows][flipped])]]
+for label, applicant_id in examples.items():
+    print(f"[{label}]\n{explain_applicant(applicant_id)}\n")
+
+# %%
+def short_label(column: str, value) -> str:
+    return {
+        "income_verification": lambda v: "Income: " + INCOME_VERIFICATION_LABELS[int(v)],
+        "loan_to_income": lambda v: f"Loan / income: {v:.0%}",
+        "withdrawal_to_deposit": lambda v: f"Withdrawals / deposits: {v:.0%}",
+        "bank_ending_balance": lambda v: f"Balance: ${v:,.0f}",
+        "bank_has_overdrafts": lambda v: "Overdrafts: " + ("yes" if v else "no"),
+    }[column](value)
+
+
+fig, axes = plt.subplots(2, 2, figsize=(11.5, 5.8), sharex=True)
+for ax, (label, applicant_id) in zip(axes.ravel(), examples.items()):
+    position = int(np.flatnonzero(resolved["applicant_id"].to_numpy() == applicant_id)[0])
+    row = core_tree.iloc[[position]]
+    probability, reasons = explainer.explain(row)
+    reasons = reasons.iloc[::-1]
+    ax.barh([short_label(c, row[c].iloc[0]) for c in reasons.index], reasons["contribution"], height=0.5,
+            color=[plots.RAISES_RISK if c > 0 else plots.LOWERS_RISK for c in reasons["contribution"]])
+    ax.axvline(0, color=plots.AXIS, linewidth=1)
+    ax.set_title(f"{applicant_id}: {probability:.0%} risk, {decision_for(probability, approve_below, deny_at)}\n{label}",
+                 fontsize=9.5)
+    ax.grid(axis="x", visible=True)
+    ax.grid(axis="y", visible=False)
+    ax.tick_params(axis="y", length=0, labelsize=8.5)
+for ax in axes[1]:
+    ax.set_xlabel("contribution to log-odds (red raises risk, blue lowers it)")
+fig.tight_layout()
+plots.save(fig, "fig11_applicant_explanations")
+plt.show()
+
+# %% [markdown]
+# - **The reasons match intuition and the data.** The denial is driven by missing income documents,
+#   overdrafts and a low balance; the review case by a loan twice the applicant's monthly income.
+# - **Each explanation says what would change the outcome,** which is what an applicant needs from an
+#   adverse-action notice. A $300 loan instead of $1,000 would be auto-approved for APP-0472, and
+#   verified income documents would move APP-0369 from denial to review.
+# - **APP-0841 shows the self-employment penalty in a single case.** The rules scored this applicant
+#   74.9, 0.1 below auto-approval; the 6-point self-employment penalty is what kept them out. The model
+#   puts their risk at 14%, well inside the approval range. One caveat: part of that low risk comes
+#   from the low-withdrawal pocket described in section 6.2 (withdrawals at 31% of deposits). Even
+#   with that factor set to typical, their risk would be 25%, still below the approval cutoff.
+
+# %% [markdown]
+# ### 6.5 Answering "why was this person denied?"
+#
+# - **Exact reasons, in order.** Every decision splits exactly into five contributions, so the reasons
+#   a reviewer or regulator sees are the model's actual computation, not an approximation fitted
+#   afterwards. Ranked by size, they serve as the principal reasons an adverse-action notice has to
+#   give.
+# - **Reasons always point the sensible way.** The direction constraints guarantee, for example, that
+#   a larger loan relative to income is never a reason for lower risk, and the tests check it.
+# - **Actionable alternatives.** Where possible the explanation says what would change the outcome: a
+#   smaller loan from the product menu, or verified income documents.
+# - **Reproducible decisions.** For each decision, log the inputs, the model version, the predicted
+#   risk, the cutoffs in force and the ranked contributions. Any past decision can then be re-derived
+#   exactly.
+# - **The whole model fits on one page.** Five learned curves plus a constant (figure 9) are the entire
+#   model. That makes it as inspectable as the rule rubric, and it was learned from outcomes rather than
+#   set by hand.
+# - **Employment status is not an input** (section 7 explains why), so it never appears as a reason.

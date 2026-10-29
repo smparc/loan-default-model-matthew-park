@@ -45,6 +45,7 @@ The script seeds NumPy's legacy global random generator (seed 42), which produce
 | `loan_risk/evaluation.py` | Ranking and probability metrics, confusion matrices under two conventions, matched-volume tiers, paired bootstrap, strategy curves, swap sets and the dollar view |
 | `loan_risk/fairness.py` | Test of whether a score mis-prices an employment group |
 | `loan_risk/modeling.py` | The candidate models (logistic regression, additive direction-constrained boosting, unconstrained boosting), repeated cross-validation, and the model-selection rule |
+| `loan_risk/explain.py` | Exact per-applicant contributions (equal to SHAP values for this additive model), plain-English reasons, and "what would change the decision" |
 | `loan_risk/plots.py` | Shared chart style (colorblind-safe palette) and figure saving |
 | `figures/` | Charts referenced in this README |
 | `results/` | CSV tables behind the numbers quoted in this README |

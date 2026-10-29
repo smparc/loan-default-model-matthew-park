@@ -80,6 +80,25 @@ def adjusted_rule_score(df: pd.DataFrame, self_employed_points: float = 60,
     return score.round(1)
 
 
+def oracle_log_odds_terms(df: pd.DataFrame) -> pd.DataFrame:
+    """The generator's true effect of each factor on the log-odds of default. Diagnostic only.
+
+    Summed and shifted by -2.25, these give the oracle's log-odds. Used only to check what the model
+    learned against the truth.
+    """
+    return pd.DataFrame(
+        {
+            "income_verification": 1.25 * (income_verification(df) != VERIFIED),
+            "loan_to_income": 1.25 * (df["loan_amount"] > df["stated_monthly_income"] * 0.3),
+            "bank_has_overdrafts": 1.0 * df["bank_has_overdrafts"],
+            "unemployed": 0.5 * df["employment_status"].eq("unemployed"),
+            "bank_ending_balance": 0.5 * (df["bank_ending_balance"] < 500),
+            "withdrawal_to_deposit": 0.5 * (df["monthly_withdrawals"] / np.maximum(df["monthly_deposits"], 1) > 0.8),
+        },
+        index=df.index,
+    ).astype(float)
+
+
 def oracle_default_probability(df: pd.DataFrame) -> np.ndarray:
     """The generator's true default probability, recomputed from the CSV. Diagnostic only.
 

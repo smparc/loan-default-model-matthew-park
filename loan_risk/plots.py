@@ -27,6 +27,8 @@ GRID = "#e1e0d9"
 AXIS = "#c3c2b7"
 BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
 MODEL_COLOR, RULES_COLOR = BLUE, MUTED
+# Diverging pair for "raises risk" vs "lowers risk" (warm vs cool, gray midpoint).
+RAISES_RISK, LOWERS_RISK, NEUTRAL = "#e34948", BLUE, "#c3c2b7"
 
 
 def apply_style() -> None:
