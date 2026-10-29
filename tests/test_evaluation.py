@@ -57,3 +57,41 @@ def test_paired_bootstrap():
     assert same["difference"] == 0 and same["ci_low"] == 0 and same["ci_high"] == 0
     better = paired_bootstrap(y, noise, y + 0.5 * noise, roc_auc_score, n_boot=200)
     assert better["difference"] > 0 and better["ci_low"] > 0
+
+
+def test_strategy_curve_by_hand():
+    from loan_risk.evaluation import strategy_curve
+
+    rates = strategy_curve([0, 1, 0, 1], [0.1, 0.9, 0.2, 0.8], [0.25, 0.5, 0.75, 1.0])
+    assert np.allclose(rates, [0.0, 0.0, 1 / 3, 0.5])
+
+
+def test_bootstrap_strategy_band_is_ordered():
+    from loan_risk.evaluation import bootstrap_strategy_band
+
+    rng = np.random.default_rng(0)
+    risk = rng.uniform(size=400)
+    y = (rng.uniform(size=400) < risk).astype(int)
+    low, high = bootstrap_strategy_band(y, risk, np.array([0.2, 0.5, 0.8]), n_boot=100)
+    assert np.all(low <= high)
+
+
+def test_approvals_at_predicted_rate():
+    from loan_risk.evaluation import approvals_at_predicted_rate
+
+    # Running averages of the sorted predictions: 0.1, 0.15, 0.2, 0.3.
+    assert approvals_at_predicted_rate([0.6, 0.1, 0.3, 0.2], 0.21) == 3
+    assert approvals_at_predicted_rate([0.6, 0.1, 0.3, 0.2], 0.16) == 2
+    assert approvals_at_predicted_rate([0.6, 0.1, 0.3, 0.2], 0.05) == 0
+
+
+def test_swap_sets_and_dollars():
+    from loan_risk.evaluation import dollars_approved, swap_sets
+
+    old = np.array(["approve", "approve", "review", "deny"], dtype=object)
+    new = np.array(["approve", "review", "approve", "deny"], dtype=object)
+    swaps = swap_sets([0, 1, 0, 1], old, new, ["a", "b", "b", "a"], order=["a", "b"])
+    assert swaps.loc["newly approved", "applicants"] == 1 and swaps.loc["newly approved", "b"] == 1
+    assert swaps.loc["no longer approved", "default rate"] == 1.0
+    dollars = dollars_approved([0, 1, 0, 1], new, [100, 200, 300, 400])
+    assert dollars == {"$ lent to defaulters": 0.0, "$ lent to repayers": 400.0}

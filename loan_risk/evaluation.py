@@ -106,6 +106,62 @@ def paired_bootstrap(y, score_a, score_b, metric, n_boot: int = 2000, seed: int 
     }
 
 
+def strategy_curve(y, risk, shares) -> np.ndarray:
+    """Default rate among the lowest-risk `share` of applicants, for each share in `shares`."""
+    y = np.asarray(y)
+    order = np.argsort(np.asarray(risk, dtype=float), kind="mergesort")
+    cumulative_rate = np.cumsum(y[order]) / np.arange(1, len(y) + 1)
+    counts = np.clip(np.round(np.asarray(shares) * len(y)).astype(int), 1, len(y))
+    return cumulative_rate[counts - 1]
+
+
+def bootstrap_strategy_band(y, risk, shares, n_boot: int = 500, seed: int = SEED) -> tuple[np.ndarray, np.ndarray]:
+    """95% band for the strategy curve, resampling applicants with replacement."""
+    y, risk = np.asarray(y), np.asarray(risk, dtype=float)
+    rng = np.random.default_rng(seed)
+    curves = []
+    for _ in range(n_boot):
+        rows = rng.integers(0, len(y), len(y))
+        curves.append(strategy_curve(y[rows], risk[rows], shares))
+    return np.percentile(curves, 2.5, axis=0), np.percentile(curves, 97.5, axis=0)
+
+
+def approvals_at_predicted_rate(p, target_rate: float) -> int:
+    """How many applicants can be approved, lowest predicted risk first, while their average
+    predicted default probability stays at or below `target_rate`.
+
+    The cutoff is set from predictions only, as it would be in production, so checking the actual
+    default rate of those applicants afterwards is a fair test.
+    """
+    expected = np.cumsum(np.sort(np.asarray(p, dtype=float))) / np.arange(1, len(p) + 1)
+    return int(np.searchsorted(expected, target_rate, side="right"))
+
+
+def swap_sets(y, old_tiers, new_tiers, groups, order) -> pd.DataFrame:
+    """Who a new system approves that the old one didn't, and the reverse, with their default rates."""
+    y, groups = np.asarray(y), np.asarray(groups)
+    old_tiers, new_tiers = np.asarray(old_tiers), np.asarray(new_tiers)
+    masks = {
+        "newly approved": (new_tiers == "approve") & (old_tiers != "approve"),
+        "no longer approved": (new_tiers != "approve") & (old_tiers == "approve"),
+    }
+    rows = {}
+    for name, mask in masks.items():
+        rows[name] = {"applicants": int(mask.sum()), "default rate": float(y[mask].mean()) if mask.any() else float("nan")}
+        rows[name] |= {group: int((groups[mask] == group).sum()) for group in order}
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+
+def dollars_approved(y, tiers, amounts) -> dict[str, float]:
+    """Total principal auto-approved, split by whether the loan defaulted."""
+    y, amounts = np.asarray(y), np.asarray(amounts, dtype=float)
+    approved = np.asarray(tiers) == "approve"
+    return {
+        "$ lent to defaulters": float(amounts[approved & (y == 1)].sum()),
+        "$ lent to repayers": float(amounts[approved & (y == 0)].sum()),
+    }
+
+
 def save_table(table: pd.DataFrame, name: str) -> None:
     """Save a results table to results/<name>.csv so the README's numbers can be checked."""
     RESULTS_DIR.mkdir(exist_ok=True)

@@ -1,0 +1,5 @@
+,ROC-AUC,PR-AUC,log-loss,Brier
+Rules as they are,0.7253,0.5494,,
+Patched rules (patch 2),0.7415,0.5532,,
+Model,0.7614,0.5504,0.5183,0.1721
+"Oracle (ceiling, diagnostic only)",0.7662,0.5368,0.5115,0.1692

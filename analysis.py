@@ -23,6 +23,7 @@
 # 2. Exploratory analysis: which signals predict default, and how
 # 3. The rule-based baseline: how well it ranks risk, what its decisions cost, and whether it is fair
 # 4. Choosing the model: three candidates compared by cross-validation, tuning, features, calibration
+# 5. The model against the baseline: the untouched test set, robustness, and what deployment would change
 #
 # To re-run: `jupytext --to ipynb analysis.py && jupyter nbconvert --to notebook --execute --inplace analysis.ipynb`
 
@@ -34,7 +35,7 @@ import numpy as np
 import pandas as pd
 from IPython.display import display
 from scipy import stats
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve
 from statsmodels.stats.proportion import proportions_ztest
 
 from loan_risk import plots
@@ -50,12 +51,19 @@ from loan_risk.data import EMPLOYMENT_GROUPS, default_label, load_applications, 
 from loan_risk.eda import adversarial_auc, binned_rate, format_rates, rate_table
 from loan_risk.evaluation import (
     CONVENTIONS,
+    approvals_at_predicted_rate,
+    binary_metrics,
+    bootstrap_strategy_band,
     confusion_table,
     convention_metrics,
+    dollars_approved,
     matched_tiers,
     paired_bootstrap,
+    probability_metrics,
     ranking_metrics,
     save_table,
+    strategy_curve,
+    swap_sets,
     tier_table,
 )
 from loan_risk.fairness import score_conditional_odds
@@ -923,3 +931,265 @@ print(f"Average predicted probability {oof.mean():.1%} vs observed default rate 
 #
 # Section 5 trains it on all 1,377 development loans and scores the untouched test set for the first
 # time.
+
+# %% [markdown]
+# ## 5. The model against the baseline
+#
+# The production model is trained once on all 1,377 development loans and then scores the 459 test
+# loans it has never seen. It is compared with the rules as they are, the patched rules from section
+# 3.5 (the stronger baseline) and the oracle ceiling.
+#
+# ### 5.1 Ranking quality on the test set
+
+# %%
+final_model = make_production_model(core_tree.columns).fit(dev(core_tree), y_dev)
+p_test = final_model.predict_proba(core_tree.iloc[test_rows])[:, 1]
+y_test = y[test_rows]
+patched_risk = -adjusted_rule_score(resolved, self_employed_points=100, ignore_deposit_consistency=True).to_numpy()
+test_scores = {
+    "Rules as they are": rule_risk[test_rows],
+    "Patched rules (patch 2)": patched_risk[test_rows],
+    "Model": p_test,
+    "Oracle (ceiling, diagnostic only)": oracle_p[test_rows],
+}
+rows = {}
+for name, score in test_scores.items():
+    rows[name] = ranking_metrics(y_test, score)
+    if name.startswith(("Model", "Oracle")):
+        rows[name] |= probability_metrics(y_test, score)
+test_ranking = pd.DataFrame.from_dict(rows, orient="index")
+display(test_ranking.round(4))
+save_table(test_ranking, "test_ranking")
+
+test_gains = pd.DataFrame.from_dict(
+    {f"Model vs {name.lower()}": paired_bootstrap(y_test, test_scores[name], p_test, roc_auc_score)
+     for name in ["Rules as they are", "Patched rules (patch 2)"]},
+    orient="index",
+)
+display(test_gains.round(4))
+save_table(test_gains, "test_auc_gains")
+print(f"Test set: the model predicts {p_test.mean():.1%} default on average; {y_test.mean():.1%} actually defaulted")
+
+# %%
+test_rule_tiers = rule_tiers(resolved)[test_rows]
+roc_styles = {
+    "Rules as they are": (plots.RULES_COLOR, 2.0),
+    "Patched rules (patch 2)": (plots.ORANGE, 2.0),
+    "Model": (plots.MODEL_COLOR, 2.4),
+    "Oracle (ceiling, diagnostic only)": (plots.INK_SECONDARY, 1.0),
+}
+fig, ax = plt.subplots(figsize=(5.4, 4.8))
+ax.plot([0, 1], [0, 1], color=plots.AXIS, linewidth=1)
+for name, score in test_scores.items():
+    fpr, tpr, _ = roc_curve(y_test, score)
+    color, width = roc_styles[name]
+    ax.plot(fpr, tpr, color=color, linewidth=width, label=f"{name}: AUC {roc_auc_score(y_test, score):.3f}")
+for flagged, label in [(("deny",), "rules: deny"), (("deny", "review"), "rules: not auto-approved")]:
+    point = binary_metrics(y_test, np.isin(test_rule_tiers, flagged))
+    ax.scatter(point["FPR"], point["recall"], s=42, color=plots.RULES_COLOR, edgecolor=plots.SURFACE, linewidth=1.5,
+               zorder=5)
+    ax.annotate(label, (point["FPR"], point["recall"]), xytext=(8, -12), textcoords="offset points", fontsize=8,
+                color=plots.INK_SECONDARY)
+ax.set_xlabel("false-positive rate (good applicants flagged)")
+ax.set_ylabel("true-positive rate (defaults flagged)")
+ax.grid(axis="x", visible=True)
+ax.legend(loc="lower right", fontsize=8)
+ax.set_title("ROC curves on the untouched test set")
+fig.tight_layout()
+plots.save(fig, "fig7_roc_test")
+plt.show()
+
+# %% [markdown]
+# - On loans it has never seen, the model reaches **AUC 0.761**, against 0.725 for the rules and 0.742
+#   for the patched rules, close to the oracle's 0.766.
+# - The gain over the rules is +0.036 (95% CI -0.002 to +0.073; 97% of bootstrap resamples favour the
+#   model), and over the patched rules +0.020 (CI -0.013 to +0.053). A 459-loan test set can't pin
+#   down differences this small, which is why section 5.3 adds a larger check.
+# - Every system scores higher here than in cross-validation, the oracle included (0.766 vs 0.733),
+#   so this test set is simply an easier sample. The gaps between systems are what matter.
+# - The probabilities stay calibrated on new data: 29.8% predicted on average, 29.6% observed.
+# - PR-AUC is about the same for every system here (0.54-0.55), the oracle included. With only 136
+#   defaults it is too noisy to separate them.
+
+# %% [markdown]
+# ### 5.2 Decisions on the test set, at today's volumes
+#
+# Each system auto-approves as many test applicants as the rules did and denies as many, so the
+# comparison is purely about who lands where. The confusion matrices use the two conventions from
+# section 3.3.
+
+# %%
+n_test_approve, n_test_deny = int((test_rule_tiers == "approve").sum()), int((test_rule_tiers == "deny").sum())
+test_tiers = {"Rules as they are": test_rule_tiers}
+for name in ["Patched rules (patch 2)", "Model", "Oracle (ceiling, diagnostic only)"]:
+    test_tiers[name] = matched_tiers(test_scores[name], n_test_approve, n_test_deny)
+display(pd.concat({name: tier_table(y_test, tiers)[["applicants", "repaid", "defaulted", "default rate"]]
+                   for name, tiers in test_tiers.items()}).round(3))
+test_conventions = pd.concat({name: convention_metrics(y_test, tiers) for name, tiers in test_tiers.items()})
+display(test_conventions.round(3))
+save_table(test_conventions, "test_conventions")
+display(pd.concat(
+    {(name, convention.split(":")[0]): confusion_table(y_test, np.isin(test_tiers[name], flagged))
+     for name in ["Rules as they are", "Model"] for convention, flagged in CONVENTIONS.items()},
+    axis=1,
+))
+
+# %% [markdown]
+# On the test set the model's gain shows up at the approval cutoff: 25 defaults slip through
+# auto-approval against the rules' 32 (the oracle also lets through 25), so under convention B its
+# false-negative rate is 18.4% against 23.5%. Its deny tier performs like the rules' (41 vs 42 defaults
+# caught). With only 67 denials per system those counts move by several loans from sample to sample,
+# so section 5.4 uses all 1,836 loans for stable estimates.
+
+# %% [markdown]
+# ### 5.3 Robustness: every loan scored out-of-fold
+#
+# 459 test loans give wide confidence intervals, and tier counts that small are noisy. So the
+# production pipeline also runs through 5-fold cross-validation repeated 5 times on all 1,836
+# resolved loans. Every loan is scored by models that never saw it; those scores, averaged over the 5
+# repeats, drive the portfolio and fairness analyses that follow. The pipeline is fixed, so nothing
+# is being selected here.
+
+# %%
+portfolio_splits = cv_splits(y, n_splits=5, n_repeats=5)
+portfolio_cv = cross_validate(make_production_model, core_tree, y, portfolio_splits)
+oof_all = portfolio_cv.mean_oof
+rows = {}
+for name, score in {"Model vs rules as they are": rule_risk, "Model vs patched rules": patched_risk}.items():
+    gain = np.array([roc_auc_score(y[test], portfolio_cv.oof[repeat, test]) - roc_auc_score(y[test], score[test])
+                     for repeat, _, test in portfolio_splits])
+    rows[name] = {"mean AUC gain": gain.mean(), "smallest": gain.min(), "largest": gain.max(),
+                  "folds where the model is better": f"{(gain > 0).sum()}/{len(gain)}"}
+robustness = pd.DataFrame.from_dict(rows, orient="index")
+display(robustness.round(4))
+save_table(robustness, "robustness_auc_gains")
+print("Out-of-fold AUC over all 1,836 loans: " + ", ".join(
+    f"{name} {roc_auc_score(y, score):.3f}"
+    for name, score in {"model": oof_all, "rules": rule_risk, "patched rules": patched_risk, "oracle": oracle_p}.items()))
+
+# %% [markdown]
+# Across 25 folds the model beats the rules in 24 (mean +0.032) and the patched rules in 22 (mean
+# +0.021). Over all 1,836 loans its out-of-fold AUC is 0.738, against 0.706 for the rules, 0.718 for
+# the patched rules and 0.741 for the oracle. The test-set result is not a fluke of one split.
+
+# %% [markdown]
+# ### 5.4 What would change if we deployed tomorrow?
+#
+# All 1,836 resolved loans, scored out-of-fold, at today's volumes: 851 auto-approved, 720 sent to
+# review, 265 denied.
+
+# %%
+portfolio_tiers = {
+    "Rules as they are": rule_decisions,
+    "Patched rules (patch 2)": matched_tiers(patched_risk, n_approve, n_deny),
+    "Model": matched_tiers(oof_all, n_approve, n_deny),
+    "Oracle (ceiling, diagnostic only)": matched_tiers(oracle_p, n_approve, n_deny),
+}
+loan_amounts = resolved["loan_amount"].to_numpy()
+rows = {}
+for name, tiers in portfolio_tiers.items():
+    approved, denied = tiers == "approve", tiers == "deny"
+    rows[name] = {
+        "defaults auto-approved": int(y[approved].sum()),
+        "defaults denied": int(y[denied].sum()),
+        "good applicants denied": int((1 - y)[denied].sum()),
+        "default rate among approved": y[approved].mean(),
+        **dollars_approved(y, tiers, loan_amounts),
+        "self-employed approval ratio": approval_ratio(tiers, "self_employed"),
+    }
+portfolio = pd.DataFrame.from_dict(rows, orient="index")
+display(portfolio.round(3))
+save_table(portfolio, "portfolio_same_volume")
+counts = ["defaults auto-approved", "defaults denied", "good applicants denied"]
+display((portfolio[counts] * 1000 / len(y)).round(1).add_suffix(" per 1,000 applications"))
+display(swap_sets(y, rule_decisions, portfolio_tiers["Model"], resolved["employment_status"],
+                  order=EMPLOYMENT_GROUPS).rename(columns=GROUP_LABELS).round(3))
+
+# %%
+for name in ["Rules as they are", "Patched rules (patch 2)"]:
+    saved = portfolio.loc[name, "$ lent to defaulters"] - portfolio.loc["Model", "$ lent to defaulters"]
+    forgone = portfolio.loc[name, "$ lent to repayers"] - portfolio.loc["Model", "$ lent to repayers"]
+    if forgone <= 0 or saved / forgone >= 1:
+        verdict = "at any realistic margin" + (f" (break-even: {saved / forgone:.0%} of principal)" if forgone > 0 else "")
+    else:
+        verdict = f"if repaid loans earn less than {saved / forgone:.0%} of principal"
+    print(f"Model vs {name.lower()}: ${saved:,.0f} less lent to defaulters, ${forgone:,.0f} less lent to repayers. "
+          f"Assuming a default loses the whole loan, the model comes out ahead {verdict}.")
+
+rule_default_rate = y[rule_decisions == "approve"].mean()
+k = approvals_at_predicted_rate(oof_all, rule_default_rate)
+growth = np.argsort(oof_all, kind="mergesort")[:k]
+print(f"\nToday the rules approve {n_approve} applicants ({n_approve / len(y):.0%}) with a {rule_default_rate:.1%} default rate.")
+print(f"Setting the model's cutoff so its predicted default rate among approved is {rule_default_rate:.1%} approves "
+      f"{k} ({k / len(y):.0%}): {k - n_approve} more. Their actual default rate: {y[growth].mean():.1%}.")
+
+# %%
+shares = np.arange(0.10, 0.951, 0.01)
+band_low, band_high = bootstrap_strategy_band(y, oof_all, shares)
+fig, ax = plt.subplots(figsize=(7.8, 4.1))
+ax.fill_between(shares, band_low, band_high, color=plots.MODEL_COLOR, alpha=0.10, linewidth=0)
+for name, score, color in [("Rules as they are", rule_risk, plots.RULES_COLOR),
+                           ("Patched rules (patch 2)", patched_risk, plots.ORANGE),
+                           ("Model (shaded: 95% band)", oof_all, plots.MODEL_COLOR)]:
+    ax.plot(shares, strategy_curve(y, score, shares), color=color, linewidth=2, label=name)
+today = n_approve / len(y)
+ax.scatter([today], [rule_default_rate], s=60, color=plots.INK, edgecolor=plots.SURFACE, linewidth=1.5, zorder=5)
+ax.annotate(f"today: {today:.0%} approved,\n{rule_default_rate:.1%} of them default", (today, rule_default_rate),
+            xytext=(-150, 22), textcoords="offset points", fontsize=8.5, color=plots.INK_SECONDARY,
+            arrowprops={"arrowstyle": "-", "color": plots.INK_SECONDARY, "linewidth": 0.8})
+ax.scatter([k / len(y)], [y[growth].mean()], s=60, color=plots.MODEL_COLOR, edgecolor=plots.SURFACE, linewidth=1.5,
+           zorder=5)
+ax.annotate(f"model at the same default rate:\n{k / len(y):.0%} approved", (k / len(y), y[growth].mean()),
+            xytext=(18, -34), textcoords="offset points", fontsize=8.5, color=plots.INK_SECONDARY,
+            arrowprops={"arrowstyle": "-", "color": plots.INK_SECONDARY, "linewidth": 0.8})
+ax.set_xlabel("share of applicants auto-approved, lowest risk first")
+ax.set_ylabel("default rate among approved")
+plots.percent_axis(ax)
+plots.percent_axis(ax, "x")
+ax.legend(loc="upper left")
+ax.set_title("Default rate among approved applicants, by approval volume")
+fig.tight_layout()
+plots.save(fig, "fig8_strategy_curve")
+plt.show()
+
+
+# %% [markdown]
+# **At today's volumes**, compared with the rules, the model:
+# - lets 13 fewer defaults through auto-approval (141 to 128: 7 fewer per 1,000 applications);
+# - catches 24 more defaults in the deny tier (143 to 167: 13 more per 1,000);
+# - wrongly denies 24 fewer good applicants (122 to 98: 13 fewer per 1,000).
+#
+# Both kinds of error fall at once, so at today's volumes there is no trade-off to weigh.
+#
+# **Who changes.** The 162 applicants the model newly approves default at 28%, and include 69
+# self-employed and 25 unemployed applicants. The 162 it stops approving default at 36% and are almost
+# all employed (153). The self-employed approval ratio rises from 0.60 to 0.89.
+#
+# **Money.** $47,400 less is lent to applicants who default (a 24% cut) and $34,000 less to applicants
+# who repay, because the model favours loans that are small relative to income. Assuming a default
+# loses the whole loan, the model beats today's rules at any realistic margin, and beats the patched
+# rules if repaid loans earn less than about 27% of principal.
+#
+# **Or grow instead.** Setting the model's cutoff so that its *predicted* default rate among approved
+# matches today's 16.6% would approve 991 applicants (54%) instead of 851 (46%), 140 more, and their
+# *actual* default rate is 16.6%, exactly as predicted. The curve shows the full menu. The model keeps
+# the default rate below today's rules at almost every approval volume. The patched rules match it
+# around today's volume (within the model's uncertainty band), but fall behind once more than about
+# 55% of applicants are approved.
+
+# %% [markdown]
+# ### 5.5 Verdict
+#
+# - **Against today's rules, the model is better on every measure:** AUC +0.032 (better in 24 of 25
+#   folds; +0.036 on the test set), fewer defaults approved, more caught, fewer good applicants denied,
+#   a quarter less money lent to defaulters, and self-employed applicants treated almost like employed
+#   ones. It reaches about 95% of the gain any model could achieve on this data.
+# - **Against the patched rules, the gain is smaller but consistent:** AUC +0.021 (better in 22 of 25
+#   folds). The two are level at today's approval cutoff (128 vs 124 defaults let through), and the
+#   model catches 12 more defaults while wrongly denying 12 fewer good applicants in the deny tier. It
+#   also produces calibrated probabilities, which the rules can't. Those are what make "approve 140
+#   more at the same default rate" possible, and they can be re-calibrated when conditions change
+#   (section 8).
+# - **Recommendation:** replace the rules with the model, starting in shadow mode. If something has to
+#   ship before the model is approved, the two-line rules patch delivers most of the fairness gain and
+#   part of the accuracy gain immediately.
