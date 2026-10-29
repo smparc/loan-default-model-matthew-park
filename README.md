@@ -31,3 +31,17 @@ Rule decisions: {'approved': 922, 'flagged_for_review': 800, 'denied': 278}
 The script seeds NumPy's legacy global random generator (seed 42), which produces the same numbers on every NumPy version. Re-running it therefore reproduces the committed file exactly (SHA-256 `f776877803cdc02d2b7b1d912b37c6d73fd05f4e1989472f5459d4f7ddce94e0`).
 
 **Note:** the brief describes the outcomes as ~78% repaid / ~14% defaulted / ~8% ongoing. The script actually produces 64.5% / 27.3% / 8.2%. All analysis uses the data as generated.
+
+## Code layout
+
+| Path | Purpose |
+|---|---|
+| `loan_risk/data.py` | Load and validate the CSV; define the label (defaulted = 1, repaid = 0; ongoing loans have no label); stratified train/test split |
+| `loan_risk/features.py` | Engineered features, the model inputs for each employment variant, and the direction constraints |
+| `tests/` | Data-integrity, leakage and feature tests |
+
+## Tests
+
+```bash
+pytest
+```
