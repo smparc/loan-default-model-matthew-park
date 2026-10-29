@@ -41,9 +41,13 @@ The script seeds NumPy's legacy global random generator (seed 42), which produce
 | `loan_risk/data.py` | Load and validate the CSV; define the label (defaulted = 1, repaid = 0; ongoing loans have no label); stratified train/test split |
 | `loan_risk/features.py` | Engineered features, the model inputs for each employment variant, and the direction constraints |
 | `loan_risk/eda.py` | Default rates with confidence intervals, decile-binned rates, and the ongoing-vs-resolved check |
+| `loan_risk/baseline.py` | The rule-based system: its score and decisions, a rebuild of the rubric, patched versions, and the oracle ceiling (diagnostic only) |
+| `loan_risk/evaluation.py` | Ranking and probability metrics, confusion matrices under two conventions, matched-volume tiers, paired bootstrap |
+| `loan_risk/fairness.py` | Test of whether a score mis-prices an employment group |
 | `loan_risk/plots.py` | Shared chart style (colorblind-safe palette) and figure saving |
 | `figures/` | Charts referenced in this README |
-| `tests/` | Data-integrity, leakage, feature and helper tests |
+| `results/` | CSV tables behind the numbers quoted in this README |
+| `tests/` | Data-integrity, leakage, feature, metric and baseline tests |
 
 To regenerate the executed notebook from its source:
 

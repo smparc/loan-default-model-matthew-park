@@ -21,6 +21,7 @@
 # **Contents**
 # 1. Data audit: what's in the data, what's missing, and where it differs from the brief
 # 2. Exploratory analysis: which signals predict default, and how
+# 3. The rule-based baseline: how well it ranks risk, what its decisions cost, and whether it is fair
 #
 # To re-run: `jupytext --to ipynb analysis.py && jupyter nbconvert --to notebook --execute --inplace analysis.ipynb`
 
@@ -30,11 +31,31 @@ import numpy as np
 import pandas as pd
 from IPython.display import display
 from scipy import stats
+from sklearn.metrics import roc_auc_score
 from statsmodels.stats.proportion import proportions_ztest
 
 from loan_risk import plots
+from loan_risk.baseline import (
+    adjusted_rule_score,
+    oracle_default_probability,
+    rebuild_rule_score,
+    rule_components,
+    rule_tiers,
+    tiers_from_score,
+)
 from loan_risk.data import EMPLOYMENT_GROUPS, default_label, load_applications, split_by_outcome
 from loan_risk.eda import adversarial_auc, binned_rate, format_rates, rate_table
+from loan_risk.evaluation import (
+    CONVENTIONS,
+    confusion_table,
+    convention_metrics,
+    matched_tiers,
+    paired_bootstrap,
+    ranking_metrics,
+    save_table,
+    tier_table,
+)
+from loan_risk.fairness import score_conditional_odds
 from loan_risk.features import INCOME_VERIFICATION_LABELS, MISMATCH_THRESHOLD, build_features
 
 plots.apply_style()
@@ -383,3 +404,233 @@ print(f"Approval ratio, self-employed vs employed: {ratio_self:.2f} (below 0.8 i
 #   count beyond zero.
 # - **No resampling.** A 30% default rate is only mildly imbalanced, and resampling would distort the
 #   predicted probabilities. Decision thresholds handle the business costs instead.
+
+# %% [markdown]
+# ## 3. The rule-based baseline
+#
+# The rules combine five factors into a 0-100 score, then approve at 75 or above, flag for human
+# review at 50-74 and deny below 50. This section measures how well that works and where it goes
+# wrong. The rules need no training, so they are evaluated on all 1,836 resolved loans.
+#
+# ### 3.1 How the score really behaves
+
+# %%
+rebuilt = rebuild_rule_score(applications)
+gap = (rebuilt - applications["rule_based_score"]).abs().round(2)
+print(f"Rebuilt rubric: same decision for {(tiers_from_score(rebuilt) == rule_tiers(applications)).sum():,} of "
+      f"{len(applications):,} applicants. Score identical for {(gap == 0).sum():,}, 0.1 apart for {(gap == 0.1).sum()}, "
+      f"further apart for {(gap > 0.1).sum()} (all from rounding in the CSV)")
+components = rule_components(applications)
+print("Income-verification points awarded:", components["income_verification"].value_counts().to_dict())
+no_docs = applications["documented_monthly_income"].isna()
+print(f"Highest score of any applicant without documents: {applications.loc[no_docs, 'rule_based_score'].max():.1f} "
+      "(auto-approval needs 75)")
+
+# %% [markdown]
+# Rebuilding the rubric from the CSV reproduces all 2,000 decisions, so the baseline is understood
+# exactly. Two quirks stand out:
+# - **Income verification is effectively all-or-nothing**: 95 points when documents match, 0
+#   otherwise. The 40-point "partial match" branch fires for one applicant, and only because the CSV
+#   rounds documented income.
+# - **Applicants without documents can never be auto-approved**: missing those 28.5 weighted points
+#   caps their score at 64.5. That fits the data (they default at 49%), but it comes from the weights
+#   rather than from an explicit policy.
+
+# %% [markdown]
+# ### 3.2 How well the rules rank risk
+
+# %%
+rule_risk = -resolved["rule_based_score"].to_numpy()
+oracle_p = oracle_default_probability(resolved)
+ranking = pd.DataFrame.from_dict(
+    {
+        "Rule-based score": ranking_metrics(y, rule_risk),
+        "Oracle: true default probability (diagnostic only)": ranking_metrics(y, oracle_p),
+    },
+    orient="index",
+)
+display(ranking.round(3))
+save_table(ranking, "baseline_ranking")
+no_risk_factors = oracle_p == oracle_p.min()
+print(f"Most any model could add over the rules: {ranking['ROC-AUC'].iloc[1] - ranking['ROC-AUC'].iloc[0]:.3f} AUC")
+print(f"Applicants with none of the generator's risk factors: {no_risk_factors.sum()}, "
+      f"and {y[no_risk_factors].mean():.0%} of them still default")
+
+# %% [markdown]
+# **AUC** is the probability that a randomly chosen defaulter gets a riskier score than a randomly
+# chosen repayer: 0.5 is a coin flip, 1.0 is perfect. **PR-AUC** (average precision) measures how
+# cleanly the riskiest scores pick out defaulters; a random score gets about 0.30 here, the default
+# rate. The rules reach **0.706 AUC**.
+#
+# Because the brief includes the generator, I can compute each applicant's true default probability:
+# the "oracle". It is never used to train, tune or select anything; it only shows the ceiling, **0.741
+# AUC**. Outcomes are noisy by design: 459 applicants with none of the risk factors still default 9% of
+# the time. So **the most any model can add over the rules is about 0.035 AUC**, and models should be
+# judged against that ceiling rather than a perfect 1.0.
+
+# %% [markdown]
+# ### 3.3 What the decisions cost
+
+# %%
+rule_decisions = rule_tiers(resolved)
+decision_table = tier_table(y, rule_decisions)
+display(decision_table.round(3))
+rule_metrics = convention_metrics(y, rule_decisions)
+display(rule_metrics.round(3))
+for name, flagged in CONVENTIONS.items():
+    print(f"Confusion matrix, convention {name}")
+    display(confusion_table(y, np.isin(rule_decisions, flagged)))
+save_table(decision_table, "baseline_tiers")
+save_table(rule_metrics, "baseline_conventions")
+
+# %% [markdown]
+# - Auto-approved applicants default at 17% and denied ones at 54%. The **review tier holds 39% of
+#   applicants with a 36% default rate, close to the 30% average**: the rules hand their hardest cases
+#   to people.
+# - Precision, recall, F1 and error rates need a yes/no prediction, but reviewers' decisions on
+#   flagged applications aren't in the data. So I report two conventions that bracket the truth:
+#   - **A** counts only "deny" as predicting default, as if reviewers approved every flagged case. Its
+#     false-positive rate is the share of good applicants wrongly denied: **9.5%**. But 74% of
+#     defaults are not denied.
+#   - **B** counts anything not auto-approved as predicting default, as if reviewers denied every
+#     flagged case. Its false-negative rate is the share of defaults that slip through
+#     auto-approval: **26%**. But 45% of good applicants are held back.
+# - The model is compared under both conventions later.
+
+# %% [markdown]
+# ### 3.4 Does the score mis-price employment groups?
+#
+# A fair score means the same risk for everyone with the same score. The test fits
+# logit(default) ~ score + employment group. If group still predicts default once the score is known,
+# the score mis-prices that group. An odds ratio below 1 means the group defaults less often than its
+# score implies, so the score over-states its risk.
+
+# %%
+score_bias = score_conditional_odds(
+    y, resolved["rule_based_score"] / 10, resolved["employment_status"], order=EMPLOYMENT_GROUPS
+)
+display(score_bias.rename(index=GROUP_LABELS).round(3))
+save_table(score_bias, "baseline_score_bias")
+
+band_labels = ["<50", "50-59", "60-69", "70-74", "75-79", "80+"]
+bands = pd.cut(resolved["rule_based_score"], [0, 50, 60, 70, 75, 80, 101], right=False,
+               labels=band_labels).astype(str).to_numpy()
+fig, ax = plt.subplots(figsize=(7.8, 3.7))
+x = np.arange(len(band_labels))
+band_rates = {}
+for group, color in [("employed", plots.BLUE), ("self_employed", plots.ORANGE)]:
+    in_group = resolved["employment_status"].eq(group).to_numpy()
+    table = rate_table(y[in_group], bands[in_group], band_labels)
+    band_rates[GROUP_LABELS[group]] = table
+    ax.fill_between(x, table["ci_low"], table["ci_high"], color=color, alpha=0.10, linewidth=0)
+    ax.plot(x, table["rate"], color=color, marker="o", markersize=6, markeredgecolor=plots.SURFACE,
+            markeredgewidth=1.5, label=GROUP_LABELS[group])
+for boundary in (0.5, 3.5):
+    ax.axvline(boundary, color=plots.AXIS, linewidth=1)
+for center, zone in [(0, "denied"), (2, "flagged for review"), (4.5, "approved")]:
+    ax.text(center, 0.80, zone, ha="center", color=plots.MUTED, fontsize=8.5)
+ax.set_xticks(x, band_labels)
+ax.set_xlabel("rule-based score")
+ax.set_ylabel("default rate")
+ax.set_ylim(0, 0.85)
+plots.percent_axis(ax)
+ax.legend(loc="lower left")
+ax.set_title("At the same rule score, self-employed applicants default less")
+fig.tight_layout()
+plots.save(fig, "fig4_rule_score_bias")
+plt.show()
+display(pd.concat({g: format_rates(t[["n", "rate", "ci_low", "ci_high"]]) for g, t in band_rates.items()}, axis=1))
+
+# %%
+score = resolved["rule_based_score"]
+self_marginal = (resolved["employment_status"].eq("self_employed") & score.between(69, 74.95)).to_numpy()
+employed_marginal = (resolved["employment_status"].eq("employed") & score.between(75, 80.95)).to_numpy()
+counts_2x2 = [[y[m].sum(), (1 - y[m]).sum()] for m in (self_marginal, employed_marginal)]
+print(f"Self-employed scoring 69-74.9 (approved if their 6-point penalty were removed): "
+      f"{y[self_marginal].mean():.0%} default (n = {self_marginal.sum()})")
+print(f"Employed scoring 75-80.9 (approved today): {y[employed_marginal].mean():.0%} default "
+      f"(n = {employed_marginal.sum()}); Fisher exact test p = {stats.fisher_exact(counts_2x2).pvalue:.2f}")
+partial_credit = rule_components(resolved)["income_level"].eq(45).to_numpy()
+employed_75 = (resolved["employment_status"].eq("employed") & score.between(75, 79.95)).to_numpy()
+print(f"Employed applicants scoring 75-79.9: {employed_75.sum()}. {partial_credit[employed_75].mean():.0%} of them "
+      f"got partial credit for income only 2-3x the loan; those default at {y[employed_75 & partial_credit].mean():.0%}")
+
+# %% [markdown]
+# **The score over-states self-employed applicants' risk.** At the same score they are about a third
+# less likely to default (odds ratio 0.67, 95% CI 0.52-0.86, p = 0.002). The chart shows it band by
+# band, most starkly at 75-79, where employed applicants default at 33% and self-employed ones at 10%.
+# This is the 6-point penalty at work (weight 0.15 times the 40-point gap): self-employed applicants
+# need better finances than employed ones to reach the same score. Unemployed applicants also do a
+# little better than their score implies (odds ratio 0.75), but that isn't statistically significant
+# (p = 0.13).
+#
+# Two supporting observations:
+# - **Near the cutoff:** self-employed applicants who would be approved without the penalty (scores
+#   69-74.9) default at 23%, while employed applicants approved today with 75-80.9 default at 34%.
+#   That points the same way but isn't significant on its own (p = 0.15), so the score-conditional
+#   test above is the real evidence.
+# - **A second rubric flaw:** employed applicants scoring 75-79 default at 33%, no less than those at
+#   70-74. Most of them (71%) only reach the approval band through partial credit for income just 2-3x
+#   the loan, and section 2.2 showed loans that large relative to income are already high-risk.
+
+# %% [markdown]
+# ### 3.5 Can a simple patch to the rules fix this?
+#
+# Before building a model, it's worth asking how far a small change to the rubric gets. Each patch is
+# applied exactly to the original score:
+# - **Patch 1:** score self-employed applicants like employed ones (+6 points).
+# - **Patch 2:** also stop rewarding deposit consistency (everyone gets those points), since it tracks
+#   employment but doesn't predict default (section 2.3).
+#
+# For a fair comparison of ranking quality, every version approves as many applicants as today's rules
+# (851) and denies as many (265). The oracle row shows the best possible result at those volumes.
+
+# %%
+n_approve, n_deny = int((rule_decisions == "approve").sum()), int((rule_decisions == "deny").sum())
+group_mask = {g: resolved["employment_status"].eq(g).to_numpy() for g in EMPLOYMENT_GROUPS}
+
+
+def approval_ratio(tiers: np.ndarray, group: str) -> float:
+    return (tiers[group_mask[group]] == "approve").mean() / (tiers[group_mask["employed"]] == "approve").mean()
+
+
+rule_versions = {
+    "Rules as they are": rule_risk,
+    "Patch 1: self-employed scored like employed": -adjusted_rule_score(resolved, self_employed_points=100).to_numpy(),
+    "Patch 2: ...and deposit consistency ignored": -adjusted_rule_score(
+        resolved, self_employed_points=100, ignore_deposit_consistency=True).to_numpy(),
+    "Oracle (ceiling, diagnostic only)": oracle_p,
+}
+rows = {}
+for name, risk in rule_versions.items():
+    same_volume = matched_tiers(risk, n_approve, n_deny)
+    gain = paired_bootstrap(y, rule_risk, risk, roc_auc_score)
+    rows[name] = {
+        "ROC-AUC": roc_auc_score(y, risk),
+        "AUC gain [95% CI]": f"{gain['difference']:+.3f} [{gain['ci_low']:+.3f}, {gain['ci_high']:+.3f}]",
+        "defaults auto-approved": int(y[same_volume == "approve"].sum()),
+        "defaults denied": int(y[same_volume == "deny"].sum()),
+        "good applicants denied": int((1 - y)[same_volume == "deny"].sum()),
+        "self-employed approval ratio": approval_ratio(same_volume, "self_employed"),
+        "unemployed approval ratio": approval_ratio(same_volume, "unemployed"),
+    }
+rule_patches = pd.DataFrame.from_dict(rows, orient="index")
+display(rule_patches.round(3))
+save_table(rule_patches, "baseline_patches")
+
+# %% [markdown]
+# - **Patch 1** lifts the self-employed approval ratio from 0.60 to 0.79 and improves ranking slightly
+#   (AUC 0.711; the confidence interval just touches zero). At the same volume it lets through fewer
+#   defaults (129 vs 141), because the self-employed applicants it promotes are safer than their old
+#   score said.
+# - **Patch 2** goes further: AUC 0.718 (a clear gain of +0.011, 95% CI +0.003 to +0.019), 124
+#   defaults auto-approved, 155 caught in the deny tier, 110 good applicants denied instead of 122,
+#   and a self-employed approval ratio of 0.88. Removing a factor that only measured employment made
+#   the rules both fairer and more accurate.
+# - **Patch 2 is the real baseline to beat.** It is a two-line change a rules team could ship
+#   tomorrow, and it captures about a third of the achievable AUC gain (0.706 to 0.718, against a
+#   0.741 ceiling). At the approval cutoff it is already close to the ceiling (124 defaults vs 123).
+#   What patches don't fix is the rest of the rubric: partial credit for income only 2-3x the loan,
+#   overdrafts carrying 6 of 100 points despite nearly doubling the default rate, and a withdrawals
+#   factor that rises in a straight line when the data shows a step near 80%. Re-tuning those by hand
+#   is what a model does systematically, and the next sections test whether that is worth it.
