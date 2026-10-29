@@ -1,0 +1,17 @@
+# Python 3.12 (see .python-version). Exact versions used to produce the results.
+
+# Analysis
+numpy==2.5.4
+pandas==3.1.0
+scipy==1.18.1
+scikit-learn==1.9.1
+statsmodels==0.15.0
+matplotlib==3.11.2
+shap==0.54.1
+
+# Notebook and tests
+jupyterlab==4.6.5
+nbconvert==7.17.2
+ipykernel==7.4.0
+jupytext==1.19.6
+pytest==9.2.0
