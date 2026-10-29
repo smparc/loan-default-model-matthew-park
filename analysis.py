@@ -22,10 +22,13 @@
 # 1. Data audit: what's in the data, what's missing, and where it differs from the brief
 # 2. Exploratory analysis: which signals predict default, and how
 # 3. The rule-based baseline: how well it ranks risk, what its decisions cost, and whether it is fair
+# 4. Choosing the model: three candidates compared by cross-validation, tuning, features, calibration
 #
 # To re-run: `jupytext --to ipynb analysis.py && jupyter nbconvert --to notebook --execute --inplace analysis.ipynb`
 
 # %%
+from functools import partial
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -43,7 +46,7 @@ from loan_risk.baseline import (
     rule_tiers,
     tiers_from_score,
 )
-from loan_risk.data import EMPLOYMENT_GROUPS, default_label, load_applications, split_by_outcome
+from loan_risk.data import EMPLOYMENT_GROUPS, default_label, load_applications, split_by_outcome, train_test_indices
 from loan_risk.eda import adversarial_auc, binned_rate, format_rates, rate_table
 from loan_risk.evaluation import (
     CONVENTIONS,
@@ -56,10 +59,35 @@ from loan_risk.evaluation import (
     tier_table,
 )
 from loan_risk.fairness import score_conditional_odds
-from loan_risk.features import INCOME_VERIFICATION_LABELS, MISMATCH_THRESHOLD, build_features
+from loan_risk.features import (
+    CANDIDATE_FEATURES,
+    EMPLOYMENT_VARIANTS,
+    FEATURE_LABELS,
+    INCOME_VERIFICATION_LABELS,
+    MISMATCH_THRESHOLD,
+    VARIANT_DESCRIPTIONS,
+    build_features,
+    linear_matrix,
+    loan_to_income_alternatives,
+    tree_matrix,
+)
+from loan_risk.modeling import (
+    ADDITIVE_GBM_PARAMS,
+    PRODUCTION_VARIANT,
+    cross_validate,
+    cv_splits,
+    make_additive_gbm,
+    make_logistic,
+    make_platt_calibrated,
+    make_production_model,
+    make_unconstrained_gbm,
+    one_se_choice,
+    reference_folds,
+    summarize,
+)
 
 plots.apply_style()
-pd.set_option("display.precision", 3)
+pd.set_option("display.precision", 4)
 GROUP_LABELS = {"employed": "Employed", "self_employed": "Self-employed", "unemployed": "Unemployed"}
 
 applications = load_applications()
@@ -634,3 +662,264 @@ save_table(rule_patches, "baseline_patches")
 #   overdrafts carrying 6 of 100 points despite nearly doubling the default rate, and a withdrawals
 #   factor that rises in a straight line when the data shows a step near 80%. Re-tuning those by hand
 #   is what a model does systematically, and the next sections test whether that is worth it.
+
+# %% [markdown]
+# ## 4. Choosing the model
+#
+# **Held-out test set.** A stratified 25% of resolved loans (459) is set aside here and not touched
+# until section 5. Every choice in this section is made by repeated cross-validation on the other
+# 1,377 loans: 5 folds, repeated 3 times with different shuffles. Each candidate is scored on 15
+# held-out folds, and all candidates use the same folds, so they can be compared fold by fold.
+#
+# **Metrics.** The main criterion is log-loss. It rewards confident, correct probabilities and heavily
+# punishes confident mistakes, so it checks ranking and calibration together. That matters because
+# lending decisions use the probabilities themselves. AUC, PR-AUC and the Brier score are reported
+# alongside it.
+#
+# **Selection rule, fixed before seeing results:** choose the candidate with the lowest
+# cross-validated log-loss, unless a simpler candidate is within one standard error of it, in which
+# case choose the simpler one.
+#
+# **Features.** The candidates use the five core features and leave employment status out (variant
+# V3). Section 4.4 shows that adding employment back doesn't change accuracy, which makes using it
+# purely a fairness question, answered in section 7.
+
+# %%
+train_rows, test_rows = train_test_indices(y)
+y_dev = y[train_rows]
+
+
+def dev(frame: pd.DataFrame) -> pd.DataFrame:
+    """The development-set rows of a per-applicant table."""
+    return frame.iloc[train_rows].reset_index(drop=True)
+
+
+splits = cv_splits(y_dev)
+rules_folds = reference_folds(rule_risk[train_rows], y_dev, splits)
+oracle_folds = reference_folds(oracle_p[train_rows], y_dev, splits, is_probability=True)
+print(f"Development set: {len(train_rows):,} loans ({y_dev.mean():.1%} defaulted). "
+      f"Test set: {len(test_rows)} loans ({y[test_rows].mean():.1%} defaulted), untouched until section 5.")
+
+# %% [markdown]
+# ### 4.1 Three candidate models
+#
+# - **M1: logistic regression.** The standard transparent credit model: each feature moves the
+#   log-odds in a straight line.
+# - **M2: additive gradient boosting with direction constraints.** Boosted trees where every tree may
+#   split on only one feature, so the model is a sum of per-feature step functions (a boosted GAM).
+#   It can learn the steps seen in section 2.2, each prediction splits exactly into per-feature
+#   contributions, and each feature's effect is forced to point the sensible way: a larger loan
+#   relative to income can never lower risk, and a larger balance can never raise it.
+# - **M3: ordinary gradient boosting**, in two sizes, with interactions allowed and no constraints. It
+#   tests whether interactions or unconstrained shapes add anything.
+
+# %%
+core_tree, core_linear = tree_matrix(features, PRODUCTION_VARIANT), linear_matrix(features, PRODUCTION_VARIANT)
+candidates = {
+    "M1: logistic regression": (make_logistic, core_linear),
+    "M2: additive GBM, direction-constrained": (make_additive_gbm, core_tree),
+    "M3: unconstrained GBM, 15 leaves": (make_unconstrained_gbm, core_tree),
+    "M3: unconstrained GBM, depth 3": (partial(make_unconstrained_gbm, max_depth=3), core_tree),
+}
+candidate_cv = {name: cross_validate(factory, dev(X), y_dev, splits) for name, (factory, X) in candidates.items()}
+model_comparison = summarize(
+    {
+        "Rules (reference)": rules_folds,
+        **{name: result.fold_metrics for name, result in candidate_cv.items()},
+        "Oracle (ceiling, diagnostic only)": oracle_folds,
+    },
+    reference_auc=rules_folds["ROC-AUC"],
+)
+display(model_comparison.round(4))
+save_table(model_comparison, "models_cv")
+
+# %%
+short_names = {
+    "M1: logistic regression": "M1 logistic regression",
+    "M3: unconstrained GBM, 15 leaves": "M3 unconstrained, 15 leaves",
+    "M3: unconstrained GBM, depth 3": "M3 unconstrained, depth 3",
+    "M2: additive GBM, direction-constrained": "M2 additive, constrained",
+}
+fold_gains = {
+    name: candidate_cv[name].fold_metrics["ROC-AUC"].to_numpy() - rules_folds["ROC-AUC"].to_numpy() for name in short_names
+}
+ceiling_gain = float((oracle_folds["ROC-AUC"] - rules_folds["ROC-AUC"]).mean())
+label_x = max(max(gain.max() for gain in fold_gains.values()), ceiling_gain) + 0.008
+jitter = np.random.default_rng(0)
+fig, ax = plt.subplots(figsize=(8.4, 3.3))
+for row, (name, gain) in enumerate(fold_gains.items()):
+    color = plots.MODEL_COLOR if name.startswith("M2") else plots.RULES_COLOR
+    ax.scatter(gain, row + jitter.uniform(-0.13, 0.13, len(gain)), s=24, color=color, edgecolor=plots.SURFACE,
+               linewidth=0.8, zorder=3)
+    ax.plot([gain.mean()] * 2, [row - 0.28, row + 0.28], color=plots.INK, linewidth=2, zorder=4)
+    ax.text(label_x, row, f"mean {gain.mean():+.3f}", va="center", fontsize=8.5, color=plots.INK_SECONDARY)
+ax.axvline(0, color=plots.AXIS, linewidth=1, zorder=1)
+ax.axvline(ceiling_gain, color=plots.INK_SECONDARY, linewidth=1, zorder=1)
+ax.text(ceiling_gain, len(fold_gains) - 0.45, f"ceiling (oracle) {ceiling_gain:+.3f}", ha="center", fontsize=8.5,
+        color=plots.INK_SECONDARY)
+ax.set_yticks(range(len(fold_gains)), list(short_names.values()))
+ax.tick_params(axis="y", length=0)
+ax.set_xlim(right=label_x + 0.03)
+ax.set_ylim(-0.6, len(fold_gains) - 0.15)
+ax.grid(axis="x", visible=True)
+ax.grid(axis="y", visible=False)
+ax.set_xlabel("AUC gain over the rules in each of the 15 cross-validation folds (bar = mean)")
+ax.set_title("The additive model beats the rules in every fold and nearly reaches the ceiling")
+fig.tight_layout()
+plots.save(fig, "fig5_model_comparison")
+plt.show()
+
+# %% [markdown]
+# - **M2 is best.** AUC 0.731 against 0.701 for the rules on these folds, better in all 15 folds, and
+#   the lowest log-loss (0.535). It captures about 95% of the gain the oracle says is possible.
+# - **M1 (logistic regression)** also beats the rules (0.721), but its log-loss is more than one
+#   standard error worse than M2's: straight-line effects can't represent the steps in section 2.2.
+# - **M3 (unconstrained boosting) does worse than M2**, and the larger version barely beats the rules
+#   (better in only 6 of 15 folds). With 1,377 loans, the freedom to fit interactions mostly fits
+#   noise, and nothing suggests the risk drivers interact.
+# - So the constraints that make M2 interpretable also make it more accurate. There is no
+#   accuracy-versus-explainability trade-off to make here.
+
+# %% [markdown]
+# ### 4.2 Tuning the additive model
+#
+# A small grid over the learning rate, the number of leaves per tree and the minimum loans per leaf
+# (12 combinations), scored on the same folds. Under the selection rule, "simpler" means fewer leaves,
+# then more loans per leaf.
+
+# %%
+grid = [
+    {"learning_rate": rate, "max_leaf_nodes": leaves, "min_samples_leaf": per_leaf}
+    for rate in (0.05, 0.1) for leaves in (4, 8, 16) for per_leaf in (20, 50)
+]
+
+
+def setting_name(setting: dict) -> str:
+    return (f"learning rate {setting['learning_rate']}, {setting['max_leaf_nodes']} leaves, "
+            f"min {setting['min_samples_leaf']} per leaf")
+
+
+grid_cv = {setting_name(s): cross_validate(partial(make_additive_gbm, **s), dev(core_tree), y_dev, splits) for s in grid}
+grid_summary = summarize({name: result.fold_metrics for name, result in grid_cv.items()})
+simplest_first = [setting_name(s) for s in sorted(
+    grid, key=lambda s: (s["max_leaf_nodes"], -s["min_samples_leaf"], grid_summary.loc[setting_name(s), "log-loss"]))]
+chosen_setting = one_se_choice(grid_summary, simplest_first)
+display(grid_summary.sort_values("log-loss").round(4))
+save_table(grid_summary, "models_grid")
+print("Chosen:", chosen_setting)
+assert chosen_setting == setting_name(ADDITIVE_GBM_PARAMS), "update ADDITIVE_GBM_PARAMS in loan_risk/modeling.py"
+
+# %% [markdown]
+# Every setting lands within 0.0007 log-loss of the others. The model is insensitive to tuning, which
+# is reassuring: its accuracy comes from its structure, not from a lucky setting. The rule picks the
+# simplest one, which also ties for the best log-loss: learning rate 0.05, 4 leaves, at least 50 loans
+# per leaf. That is the production model from here on.
+
+# %% [markdown]
+# ### 4.3 Which features earn their place?
+#
+# Each candidate column is added to the core five, one at a time. Loan ÷ income is also recomputed
+# using documented income or bank deposits instead of stated income.
+
+# %%
+feature_sets = {"Core five (selected)": core_tree}
+for extra in CANDIDATE_FEATURES:
+    feature_sets[f"+ {FEATURE_LABELS[extra].lower()}"] = tree_matrix(features, PRODUCTION_VARIANT, (extra,))
+for name, alternative in loan_to_income_alternatives(resolved).items():
+    if name != "stated income":
+        feature_sets[f"loan / income using {name}"] = core_tree.assign(loan_to_income=alternative.to_numpy())
+feature_summary = summarize(
+    {name: cross_validate(make_production_model, dev(X), y_dev, splits).fold_metrics for name, X in feature_sets.items()}
+)
+display(feature_summary.round(4))
+save_table(feature_summary, "models_feature_ablation")
+
+# %% [markdown]
+# - **No extra column improves log-loss by more than its standard error**, so under the selection rule
+#   none is added. The document count comes closest, but its only real signal is "zero documents",
+#   which income verification already captures (one and two documents default at 25% and 28%).
+#   Adding raw stated income makes the model worse.
+# - **Stated income gives the best loan ÷ income.** The bank-deposit version costs a little (log-loss
+#   +0.0035, within one standard error) but is harder for applicants to game, which is worth weighing
+#   in production (section 8).
+
+# %% [markdown]
+# ### 4.4 Does employment status add accuracy?
+
+# %%
+variant_cv = {v: cross_validate(make_production_model, dev(tree_matrix(features, v)), y_dev, splits) for v in EMPLOYMENT_VARIANTS}
+variant_summary = summarize(
+    {f"{v}: {VARIANT_DESCRIPTIONS[v]}": result.fold_metrics for v, result in variant_cv.items()},
+    reference_auc=rules_folds["ROC-AUC"],
+)
+display(variant_summary.round(4))
+save_table(variant_summary, "models_employment_variants")
+
+# %% [markdown]
+# All three variants are equally accurate: log-loss within 0.0007 of each other, with the version
+# without employment nominally the best. Once income verification, affordability and bank behaviour
+# are known, employment status adds no predictive value. So whether to use it is entirely a fairness
+# question (section 7). The working model leaves it out.
+
+# %% [markdown]
+# ### 4.5 Are the probabilities calibrated?
+#
+# A calibrated model's 20% means 20%: among applicants given 20%, about one in five defaults. That
+# matters when probabilities drive thresholds, pricing or expected-loss estimates.
+
+# %%
+selected_cv = variant_cv[PRODUCTION_VARIANT]
+platt_cv = cross_validate(make_platt_calibrated, dev(core_tree), y_dev, splits)
+display(summarize({"Selected model": selected_cv.fold_metrics,
+                   "Selected model + Platt scaling": platt_cv.fold_metrics}).round(4))
+
+oof = selected_cv.mean_oof
+decile = pd.qcut(oof, 10, labels=False)
+calibration = rate_table(y_dev, decile, list(range(10)))
+calibration["predicted"] = pd.Series(oof).groupby(decile).mean()
+calibration["predicted inside 95% CI"] = calibration["predicted"].between(calibration["ci_low"], calibration["ci_high"])
+
+fig, ax = plt.subplots(figsize=(4.8, 4.3))
+ax.plot([0, 0.8], [0, 0.8], color=plots.AXIS, linewidth=1, zorder=1)
+ax.text(0.52, 0.70, "perfect calibration", fontsize=8, color=plots.MUTED, ha="center")
+ax.errorbar(calibration["predicted"], calibration["rate"],
+            yerr=[calibration["rate"] - calibration["ci_low"], calibration["ci_high"] - calibration["rate"]],
+            fmt="none", ecolor=plots.INK_SECONDARY, elinewidth=1, zorder=2)
+ax.plot(calibration["predicted"], calibration["rate"], color=plots.BLUE, marker="o", markersize=6,
+        markeredgecolor=plots.SURFACE, markeredgewidth=1.5, zorder=3)
+ax.set_xlim(0, 0.8)
+ax.set_ylim(0, 0.8)
+plots.percent_axis(ax)
+plots.percent_axis(ax, "x")
+ax.grid(axis="x", visible=True)
+ax.set_xlabel("predicted default probability (decile average)")
+ax.set_ylabel("observed default rate")
+ax.set_title("Predicted vs observed default rate")
+fig.tight_layout()
+plots.save(fig, "fig6_calibration")
+plt.show()
+display(format_rates(calibration[["n", "predicted", "rate", "ci_low", "ci_high", "predicted inside 95% CI"]],
+                     columns=("predicted", "rate", "ci_low", "ci_high")))
+print(f"Average predicted probability {oof.mean():.1%} vs observed default rate {y_dev.mean():.1%}")
+
+# %% [markdown]
+# Calibration is good: 29.7% predicted on average against 29.7% observed, and in every decile the
+# predicted rate falls inside the 95% confidence interval of the observed rate. Platt scaling
+# (refitting a sigmoid on top) doesn't improve log-loss, so the model is used as is. That also keeps
+# its explanations simple, because every contribution is in the model's own log-odds.
+
+# %% [markdown]
+# ### 4.6 The choice
+#
+# The production model is **M2: additive gradient boosting with direction constraints** (learning
+# rate 0.05, 4 leaves, at least 50 loans per leaf) on the five core features, without employment
+# status and without recalibration.
+# - **It wins on the rule set in advance:** lowest cross-validated log-loss, better than the rules in
+#   all 15 folds, about 95% of the possible AUC gain.
+# - **It is interpretable by design:** every prediction is a sum of five per-feature contributions,
+#   and each feature's effect points the sensible way (section 6 shows them).
+# - **The choice isn't fragile:** every tuning setting performs the same, no extra column helps, and
+#   employment status adds nothing.
+#
+# Section 5 trains it on all 1,377 development loans and scores the untouched test set for the first
+# time.

@@ -1,0 +1,13 @@
+,ROC-AUC,ROC-AUC sd,PR-AUC,log-loss,log-loss se,Brier
+"learning rate 0.05, 4 leaves, min 20 per leaf",0.7312,0.0245,0.5399,0.5343,0.0045,0.1789
+"learning rate 0.05, 4 leaves, min 50 per leaf",0.7317,0.0242,0.5414,0.5341,0.0043,0.1788
+"learning rate 0.05, 8 leaves, min 20 per leaf",0.7315,0.0248,0.5397,0.5341,0.0045,0.1788
+"learning rate 0.05, 8 leaves, min 50 per leaf",0.7316,0.0244,0.5422,0.5343,0.0043,0.1788
+"learning rate 0.05, 16 leaves, min 20 per leaf",0.7315,0.0248,0.5397,0.5341,0.0045,0.1788
+"learning rate 0.05, 16 leaves, min 50 per leaf",0.7316,0.0244,0.5422,0.5343,0.0043,0.1788
+"learning rate 0.1, 4 leaves, min 20 per leaf",0.7309,0.0251,0.539,0.5348,0.0047,0.1791
+"learning rate 0.1, 4 leaves, min 50 per leaf",0.7316,0.0246,0.5404,0.5345,0.0045,0.1789
+"learning rate 0.1, 8 leaves, min 20 per leaf",0.7312,0.0249,0.5391,0.5344,0.0047,0.179
+"learning rate 0.1, 8 leaves, min 50 per leaf",0.7319,0.0242,0.5416,0.5345,0.0046,0.1789
+"learning rate 0.1, 16 leaves, min 20 per leaf",0.7312,0.0249,0.5391,0.5344,0.0047,0.179
+"learning rate 0.1, 16 leaves, min 50 per leaf",0.7319,0.0242,0.5416,0.5345,0.0046,0.1789

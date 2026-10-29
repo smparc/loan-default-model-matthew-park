@@ -44,6 +44,7 @@ The script seeds NumPy's legacy global random generator (seed 42), which produce
 | `loan_risk/baseline.py` | The rule-based system: its score and decisions, a rebuild of the rubric, patched versions, and the oracle ceiling (diagnostic only) |
 | `loan_risk/evaluation.py` | Ranking and probability metrics, confusion matrices under two conventions, matched-volume tiers, paired bootstrap |
 | `loan_risk/fairness.py` | Test of whether a score mis-prices an employment group |
+| `loan_risk/modeling.py` | The candidate models (logistic regression, additive direction-constrained boosting, unconstrained boosting), repeated cross-validation, and the model-selection rule |
 | `loan_risk/plots.py` | Shared chart style (colorblind-safe palette) and figure saving |
 | `figures/` | Charts referenced in this README |
 | `results/` | CSV tables behind the numbers quoted in this README |

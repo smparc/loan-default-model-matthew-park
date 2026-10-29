@@ -17,3 +17,8 @@ def resolved(applications):
 @pytest.fixture(scope="session")
 def features(applications):
     return build_features(applications)
+
+
+@pytest.fixture(scope="session")
+def resolved_features(resolved):
+    return build_features(resolved)
