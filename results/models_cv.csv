@@ -1,0 +1,7 @@
+,ROC-AUC,ROC-AUC sd,PR-AUC,log-loss,log-loss se,Brier,AUC gain vs rules,folds better than rules
+Rules (reference),0.7005,0.0248,0.4978,,,,0.0,0/15
+M1: logistic regression,0.721,0.0224,0.5253,0.5455,0.004,0.183,0.0205,15/15
+"M2: additive GBM, direction-constrained",0.7313,0.0235,0.5383,0.5348,0.0042,0.1791,0.0308,15/15
+"M3: unconstrained GBM, 15 leaves",0.7022,0.0198,0.4913,0.5629,0.0047,0.1889,0.0017,6/15
+"M3: unconstrained GBM, depth 3",0.7176,0.0194,0.5098,0.5482,0.0035,0.1843,0.0171,13/15
+"Oracle (ceiling, diagnostic only)",0.7329,0.0261,0.5301,0.529,0.0049,0.1769,0.0323,15/15

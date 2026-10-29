@@ -1,0 +1,9 @@
+,ROC-AUC,ROC-AUC sd,PR-AUC,log-loss,log-loss se,Brier
+Core five (selected),0.7317,0.0242,0.5414,0.5341,0.0043,0.1788
++ consistent deposits,0.7321,0.0244,0.5421,0.5341,0.0042,0.1787
++ documents submitted,0.734,0.0246,0.5426,0.533,0.0045,0.1785
++ stated monthly income ($),0.7279,0.0246,0.5357,0.5386,0.0045,0.1804
++ loan amount ($),0.73,0.0237,0.5402,0.5354,0.0042,0.1792
++ documented / stated income,0.7317,0.0241,0.5414,0.5343,0.0043,0.1788
+loan / income using documented income (stated if missing),0.7244,0.0264,0.5252,0.5412,0.0045,0.1814
+loan / income using bank deposits,0.7289,0.0272,0.5318,0.5376,0.0046,0.1801

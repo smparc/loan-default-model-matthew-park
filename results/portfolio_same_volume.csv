@@ -1,0 +1,5 @@
+,defaults auto-approved,defaults denied,good applicants denied,default rate among approved,$ lent to defaulters,$ lent to repayers,self-employed approval ratio
+Rules as they are,141,143,122,0.1657,193500.0,722500.0,0.5963
+Patched rules (patch 2),124,155,110,0.1457,159600.0,738600.0,0.8783
+Model,128,167,98,0.1504,146100.0,688500.0,0.8911
+"Oracle (ceiling, diagnostic only)",123,170,95,0.1445,190100.0,767800.0,0.9289

@@ -36,9 +36,26 @@ The script seeds NumPy's legacy global random generator (seed 42), which produce
 
 | Path | Purpose |
 |---|---|
+| `analysis.ipynb` | The analysis, executed with outputs (start here) |
+| `analysis.py` | The same notebook as plain text (jupytext), for readable diffs |
 | `loan_risk/data.py` | Load and validate the CSV; define the label (defaulted = 1, repaid = 0; ongoing loans have no label); stratified train/test split |
 | `loan_risk/features.py` | Engineered features, the model inputs for each employment variant, and the direction constraints |
-| `tests/` | Data-integrity, leakage and feature tests |
+| `loan_risk/eda.py` | Default rates with confidence intervals, decile-binned rates, and the ongoing-vs-resolved check |
+| `loan_risk/baseline.py` | The rule-based system: its score and decisions, a rebuild of the rubric, patched versions, and the oracle ceiling (diagnostic only) |
+| `loan_risk/evaluation.py` | Ranking and probability metrics, confusion matrices under two conventions, matched-volume tiers, paired bootstrap, strategy curves, swap sets and the dollar view |
+| `loan_risk/fairness.py` | Per-group approval, error and calibration tables, and the test of whether a score mis-prices an employment group |
+| `loan_risk/modeling.py` | The candidate models (logistic regression, additive direction-constrained boosting, unconstrained boosting), repeated cross-validation, and the model-selection rule |
+| `loan_risk/explain.py` | Exact per-applicant contributions (equal to SHAP values for this additive model), plain-English reasons, and "what would change the decision" |
+| `loan_risk/plots.py` | Shared chart style (colorblind-safe palette) and figure saving |
+| `figures/` | Charts referenced in this README |
+| `results/` | CSV tables behind the numbers quoted in this README |
+| `tests/` | Data-integrity, leakage, feature, metric and baseline tests |
+
+To regenerate the executed notebook from its source:
+
+```bash
+jupytext --to ipynb analysis.py && jupyter nbconvert --to notebook --execute --inplace analysis.ipynb
+```
 
 ## Tests
 
