@@ -102,7 +102,7 @@ def rate_bars(ax: plt.Axes, table, labels, color: str = BLUE, width: float = 0.3
         low, high = table["ci_low"].to_numpy(dtype=float), table["ci_high"].to_numpy(dtype=float)
         ax.errorbar(x, rate, yerr=[rate - low, high - rate], fmt="none", ecolor=INK_SECONDARY, elinewidth=1, zorder=3)
         tops = high
-    for xi, value, top in zip(x, rate, tops):
+    for xi, value, top in zip(x, rate, tops, strict=True):
         ax.text(xi, top + 0.015, _pct(value), ha="center", va="bottom", fontsize=9, color=INK)
     ax.set_xticks(x, labels)
     ax.tick_params(axis="x", length=0)
