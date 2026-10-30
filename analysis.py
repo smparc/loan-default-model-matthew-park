@@ -26,6 +26,7 @@
 # 5. The model against the baseline: the untouched test set, robustness, and what deployment would change
 # 6. Explaining decisions: exact per-applicant reasons, what the model learned, what would change a decision
 # 7. Fairness across employment groups: who gets approved, who bears the errors, and what to do about it
+# 8. Scoring the ongoing loans
 #
 # To re-run: `jupytext --to ipynb analysis.py && jupyter nbconvert --to notebook --execute --inplace analysis.ipynb`
 
@@ -102,6 +103,7 @@ from loan_risk.features import (
 )
 from loan_risk.modeling import (
     ADDITIVE_GBM_PARAMS,
+    RECOMMENDED_VARIANT,
     WORKING_VARIANT,
     cross_validate,
     cv_splits,
@@ -1767,3 +1769,26 @@ print("Share without income documents: " + ", ".join(
 #
 # Sections 4-6 used V3 as the working model. V2 performs the same overall (section 7.4), so those
 # results carry over; the differences are the group-level ones shown here.
+
+# %% [markdown]
+# ## 8. Scoring the ongoing loans
+#
+# The 164 ongoing loans were left out of training because they have no outcome yet (section 1.6).
+# The recommended model (V2: five core features plus the unemployed flag), refitted on all 1,836
+# resolved loans, scores them here, using decision cutoffs that reproduce today's volumes. When these
+# loans resolve, comparing their outcomes with these predictions is the first live calibration check.
+
+# %%
+recommended_X = tree_matrix(features, RECOMMENDED_VARIANT)
+recommended_model = make_production_model(recommended_X.columns).fit(recommended_X, y)
+v2_approve_below = float(np.quantile(variant_oof["V2"], n_approve / len(y)))
+v2_deny_at = float(np.quantile(variant_oof["V2"], 1 - n_deny / len(y)))
+p_ongoing = recommended_model.predict_proba(tree_matrix(build_features(ongoing), RECOMMENDED_VARIANT))[:, 1]
+ongoing_decision = np.where(p_ongoing < v2_approve_below, "approve",
+                            np.where(p_ongoing >= v2_deny_at, "deny", "review"))
+ongoing_scores = pd.DataFrame({"applicant_id": ongoing["applicant_id"], "predicted default risk": p_ongoing.round(4),
+                               "model decision": ongoing_decision, "rules decision": ongoing["rule_based_decision"]})
+save_table(ongoing_scores.set_index("applicant_id"), "ongoing_scores")
+print(f"Expected defaults among the {len(ongoing)} ongoing loans: {p_ongoing.sum():.0f} ({p_ongoing.mean():.1%}); "
+      f"the generator's true probabilities imply {oracle_default_probability(ongoing).sum():.0f}")
+display(pd.crosstab(ongoing_scores["rules decision"], ongoing_scores["model decision"], margins=True))
