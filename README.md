@@ -39,7 +39,7 @@ The script seeds NumPy's legacy random generator, which produces the same number
 - **The brief's class balance is wrong:** 27% of applications default (29.7% of the 1,836 resolved loans), not ~14%. That's only mild imbalance, so no resampling, which would distort the probabilities. Costs go into decision thresholds; I report PR-AUC, never accuracy.
 - **Missing income documents are a signal** ([fig. 1](figures/fig1_income_verification.png)): the 283 applicants without documents default at 49%, against 26% when income is verified. Documented ÷ stated income is either 90–105% or 21–40%, so misrepresentation separates cleanly; the brief's "3x+" rule misses 29 of the 85 cases. Both become one feature, `income_verification`, with no imputed income.
 - **Risk jumps in steps** ([fig. 2](figures/fig2_risk_steps.png)): 14–19% default below a 30% loan-to-income ratio, 39–46% above. The model needs to learn thresholds.
-- **The 164 ongoing loans are excluded from training.** Here they're indistinguishable from resolved loans (every p ≥ 0.096; classifier AUC 0.52 and 0.43). In production, use a 180-day performance window, since every default occurs by day 179. The model expects 50 of the 164 to default (truth: 51).
+- **The 164 ongoing loans are excluded from training.** Here they're indistinguishable from resolved loans (every p ≥ 0.096; classifier AUC 0.52 and 0.43). In production, use a 180-day performance window, since every default occurs by day 179. The model expects 50 of the 164 to default; the true probabilities imply 51.
 - **Dropped:**
   - `days_to_default` leaks the outcome.
   - The rule score and decision are the old system's outputs.
@@ -48,12 +48,12 @@ The script seeds NumPy's legacy random generator, which produces the same number
 
 ### 2. Model and features
 
-- **Gradient boosting where every tree uses one feature, with fixed directions of effect.** Each prediction splits exactly into five per-feature contributions (the exact SHAP values; [fig. 10](figures/fig10_contributions_beeswarm.png)), and a larger loan relative to income can never lower risk. Built with scikit-learn, since XGBoost needs an extra system library on macOS.
+- **Gradient boosting where every tree uses one feature, with direction constraints.** Each prediction splits exactly into five per-feature contributions (the exact SHAP values; [fig. 10](figures/fig10_contributions_beeswarm.png)), and a larger loan relative to income can never lower risk. Built with scikit-learn, since XGBoost needs an extra system library on macOS.
 - **Selection rule, fixed in advance** ([fig. 5](figures/fig5_model_comparison.png)): with 25% held out, lowest cross-validated log-loss wins, unless a simpler model is within one standard error.
   - AUC: rules 0.701, logistic regression 0.721, unconstrained boosting 0.702–0.718 (it overfits), the additive model 0.731, and the oracle ceiling 0.733 (the generator's true probabilities, a reference only).
   - The constraints make the model both more interpretable and more accurate.
 - **What matters most** ([fig. 9](figures/fig9_learned_effects.png)): loan ÷ income, then income verification, overdrafts, withdrawals and balance. The model found the true 30% threshold on its own. One weak-feature artifact (low withdrawals) is disclosed rather than tuned away (notebook section 6.2).
-- **Explaining one applicant** ([fig. 11](figures/fig11_applicant_explanations.png)): `explain_applicant(id)` gives the ranked reasons and what would change the outcome, for example "a $300 loan instead of $1,000 would be auto-approved".
+- **Explaining one applicant** ([fig. 11](figures/fig11_applicant_explanations.png)): `explain_applicant(id)` (notebook section 6.4) gives the ranked reasons and what would change the outcome, for example "a $300 loan instead of $1,000 would be auto-approved".
 
 ### 3. Results and trade-offs
 
@@ -71,7 +71,7 @@ At today's volumes (851 auto-approved, 720 reviewed, 265 denied), all 1,836 loan
 
 - **Held-out test set** ([fig. 7](figures/fig7_roc_test.png)): AUC 0.761 vs 0.725 (gain 95% CI −0.002 to +0.073; 97% of bootstrap resamples favour the model).
 - **Robustness:** the model beats the rules in 24 of 25 folds and captures 91% of the achievable gain.
-- **Calibration** ([fig. 6](figures/fig6_calibration.png)): 29.8% default predicted vs 29.6% observed on the test set.
+- **Calibration:** in cross-validation, every decile's prediction falls inside its 95% interval ([fig. 6](figures/fig6_calibration.png)); on the test set, 29.8% default was predicted and 29.6% observed.
 - **The brief's metrics** need a yes/no prediction, but reviewers' decisions on flagged cases are unknown, so two conventions bracket the truth:
   - **A** (only "deny" = predicted default): precision 0.54 → 0.63, recall 0.26 → 0.31, F1 0.35 → 0.41, good applicants wrongly denied 9.5% → 7.6%.
   - **B** (not auto-approved = predicted default): F1 0.528 → 0.545, defaults slipping through 25.9% → 23.5%.
@@ -87,14 +87,14 @@ At today's volumes (851 auto-approved, 720 reviewed, 265 denied), all 1,836 loan
 
 ### 4. Fairness
 
-- **The rules are biased against self-employed applicants** ([fig. 3](figures/fig3_employment.png), [fig. 4](figures/fig4_rule_score_bias.png)). They default like employed applicants (29.0% vs 27.2%, p = 0.45) but are auto-approved 36% vs 60% of the time. At the same score they're a third less likely to default (odds ratio 0.67, p = 0.002).
+- **The rules are biased against self-employed applicants** ([fig. 3](figures/fig3_employment.png), [fig. 4](figures/fig4_rule_score_bias.png)). They default like employed applicants (29.0% vs 27.2%, p = 0.45) but are auto-approved 36% vs 60% of the time. At the same score, their odds of default are a third lower (odds ratio 0.67, p = 0.002).
 - **The model corrects it** ([fig. 12](figures/fig12_fairness_by_group.png)).
   - Approval ratio 0.60 → 0.89 (0.93 at true risk); odds ratio 0.99.
   - The model's inputs can't infer self-employment (AUC 0.51–0.54).
-  - Creditworthy unemployed applicants wrongly denied: 45% → 12% (13% at true risk).
+  - Creditworthy unemployed applicants wrongly denied: 45% → 12% for V3 and 16% for V2 (13% at true risk).
 - **Unemployment is the hard case.** Unemployed applicants really are riskier (47% default), mostly through affordability: 91% ask for loans above 30% of their income.
   - Dropping employment (V3) doesn't remove the information, because the inputs predict unemployment at AUC 0.82–0.86. It makes the model understate their risk by about 6 points.
-  - V3 approves 27 unemployed applicants where true risk justifies 10, and the 14 extra approvals default at 50%.
+  - V3 approves 27 unemployed applicants where true risk justifies 10. The 14 it approves that V2 doesn't default at 50%.
   - Aggregate accuracy (AUC 0.738–0.739 for every variant) can't see this.
 - **Recommendation: an "unemployed" flag, with self-employed treated exactly like employed (V2).** Equally accurate, calibrated for every group, and 13 unemployed approvals against 10 at true risk.
   - It needs compliance sign-off (source of income is protected in some places, for example Quebec's "social condition"). Otherwise, drop employment and monitor.
@@ -112,7 +112,7 @@ At today's volumes (851 auto-approved, 720 reviewed, 265 denied), all 1,836 loan
 - **Open questions:**
   - *20% more defaults caught vs 10% more good applicants denied* means 109 vs 129 applicants here. It's worth it if the loss per default × 109 exceeds the margin per good loan × 129 (with equal loan sizes, margins below about 85% of principal). The business decides, with compliance.
   - *"Why was this person denied?":* exact ranked reasons, a decision log, and a model that fits on one page (fig. 9).
-  - *Recession:* the model's probabilities would run low. Recalibrate the intercept from early delinquency and retrain; the rules can't adapt.
+  - *Recession:* the model's probabilities would run low. Recalibrate the intercept from early delinquency and retrain. The rules have no probabilities to recalibrate.
 - **Synthetic-data caveat:** outcomes exist even for denied applicants. Real data only covers approved loans, so keep a small randomized exploration slice.
 
 **With more time:** out-of-time validation, reject inference, Explainable Boosting Machines for smoother weak features, and income-stability features from bank transactions.

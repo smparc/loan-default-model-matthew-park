@@ -279,8 +279,9 @@ for name, auc in adversarial_auc(all_features, is_ongoing).items():
 # The averages differ a little (for example, 21% vs 16% have overdrafts), but no difference is
 # statistically significant for a group of 164, and neither classifier can tell the groups apart.
 # With no real signal, cross-validated AUC scatters around 0.5 and can land below it, as it does for
-# gradient boosting here. In this dataset "ongoing" was assigned at random, so **leaving these 164
-# loans out of training introduces no bias here.**
+# gradient boosting here. In this dataset "ongoing" was assigned at random: the generator gives every
+# row its own 8% chance (`ongoing = np.random.random(n) < 0.08`), ignoring every feature and the
+# outcome. So **leaving these 164 loans out of training introduces no bias here.**
 #
 # In a real lending book it would. Ongoing loans are the newest ones, and among new loans the fast
 # defaulters are already labeled while slow outcomes are not. Dropping them over-weights early
@@ -615,8 +616,8 @@ print(f"Employed applicants scoring 75-79.9: {employed_75.sum()}. {partial_credi
       f"got partial credit for income only 2-3x the loan; those default at {y[employed_75 & partial_credit].mean():.0%}")
 
 # %% [markdown]
-# **The score over-states self-employed applicants' risk.** At the same score they are about a third
-# less likely to default (odds ratio 0.67, 95% CI 0.52-0.86, p = 0.002). The chart shows it band by
+# **The score over-states self-employed applicants' risk.** At the same score their odds of default
+# are about a third lower (odds ratio 0.67, 95% CI 0.52-0.86, p = 0.002). The chart shows it band by
 # band, most starkly at 75-79, where employed applicants default at 33% and self-employed ones at 10%.
 # This is the 6-point penalty at work (weight 0.15 times the 40-point gap): self-employed applicants
 # need better finances than employed ones to reach the same score. Unemployed applicants also do a
