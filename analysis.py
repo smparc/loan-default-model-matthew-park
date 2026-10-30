@@ -352,7 +352,7 @@ drivers = {
 }
 fig, axes = plt.subplots(1, 3, figsize=(11, 3.4), sharey=True)
 binned = {}
-for ax, (column, title) in zip(axes, drivers.items()):
+for ax, (column, title) in zip(axes, drivers.items(), strict=True):
     table = binned_rate(features[column], y, n_bins=10)
     binned[title] = table
     ax.axhline(y.mean(), color=plots.MUTED, linewidth=1, zorder=1)
@@ -714,6 +714,11 @@ save_table(rule_patches, "baseline_patches")
 # **Features.** The candidates use the five core features and leave employment status out (variant
 # V3). Section 4.4 shows that adding employment back doesn't change accuracy, which makes using it
 # purely a fairness question, answered in section 7.
+#
+# **What the test set protects.** The exploration in sections 1-3 looked at all resolved loans. The
+# feature definitions it led to have no fitted parameters (the income-mismatch cutoff sits in an
+# empty gap, and the dropped columns showed no signal), so what the held-out test set guards is
+# everything that is fitted or selected: the model family, its settings and its decision cutoffs.
 
 # %%
 train_rows, test_rows = train_test_indices(y)
@@ -872,7 +877,7 @@ save_table(feature_summary, "models_feature_ablation")
 #   Adding raw stated income makes the model worse.
 # - **Stated income gives the best loan ÷ income.** The bank-deposit version costs a little (log-loss
 #   +0.0035, within one standard error) but is harder for applicants to game, which is worth weighing
-#   in production (section 8).
+#   in production (README, section 5).
 
 # %% [markdown]
 # ### 4.4 Does employment status add accuracy?
@@ -1090,11 +1095,15 @@ save_table(robustness, "robustness_auc_gains")
 print("Out-of-fold AUC over all 1,836 loans: " + ", ".join(
     f"{name} {roc_auc_score(y, score):.3f}"
     for name, score in {"model": oof_all, "rules": rule_risk, "patched rules": patched_risk, "oracle": oracle_p}.items()))
+gain_captured = (roc_auc_score(y, oof_all) - roc_auc_score(y, rule_risk)) / (
+    roc_auc_score(y, oracle_p) - roc_auc_score(y, rule_risk))
+print(f"Share of the achievable AUC gain (oracle minus rules) that the model captures: {gain_captured:.0%}")
 
 # %% [markdown]
 # Across 25 folds the model beats the rules in 24 (mean +0.032) and the patched rules in 22 (mean
 # +0.021). Over all 1,836 loans its out-of-fold AUC is 0.738, against 0.706 for the rules, 0.718 for
-# the patched rules and 0.741 for the oracle. The test-set result is not a fluke of one split.
+# the patched rules and 0.741 for the oracle: 91% of the gain the oracle says is possible (95% in the
+# development-set cross-validation of section 4). The test-set result is not a fluke of one split.
 
 # %% [markdown]
 # ### 5.4 What would change if we deployed tomorrow?
@@ -1128,6 +1137,16 @@ counts = ["defaults auto-approved", "defaults denied", "good applicants denied"]
 display((portfolio[counts] * 1000 / len(y)).round(1).add_suffix(" per 1,000 applications"))
 display(swap_sets(y, rule_decisions, portfolio_tiers["Model"], resolved["employment_status"],
                   order=EMPLOYMENT_GROUPS).rename(columns=GROUP_LABELS).round(3))
+
+# %%
+portfolio_conventions = pd.concat({name: convention_metrics(y, tiers) for name, tiers in portfolio_tiers.items()})
+display(portfolio_conventions.round(3))
+save_table(portfolio_conventions, "portfolio_conventions")
+display(pd.concat(
+    {(name, convention.split(":")[0]): confusion_table(y, np.isin(portfolio_tiers[name], flagged))
+     for name in ["Rules as they are", "Model"] for convention, flagged in CONVENTIONS.items()},
+    axis=1,
+))
 
 # %%
 for name in ["Rules as they are", "Patched rules (patch 2)"]:
@@ -1183,6 +1202,11 @@ plt.show()
 # - catches 24 more defaults in the deny tier (143 to 167: 13 more per 1,000);
 # - wrongly denies 24 fewer good applicants (122 to 98: 13 fewer per 1,000).
 #
+# In the brief's terms, using the two conventions from section 3.3: under A, precision rises from 0.54
+# to 0.63, recall from 0.26 to 0.31 and F1 from 0.35 to 0.41, while the false-positive rate (good
+# applicants wrongly denied) falls from 9.5% to 7.6%. Under B, F1 rises from 0.528 to 0.545 and the
+# false-negative rate (defaults that slip through auto-approval) falls from 25.9% to 23.5%.
+#
 # Both kinds of error fall at once, so at today's volumes there is no trade-off to weigh.
 #
 # **Who changes.** The 162 applicants the model newly approves default at 28%, and include 69
@@ -1207,13 +1231,13 @@ plt.show()
 # - **Against today's rules, the model is better on every measure:** AUC +0.032 (better in 24 of 25
 #   folds; +0.036 on the test set), fewer defaults approved, more caught, fewer good applicants denied,
 #   a quarter less money lent to defaulters, and self-employed applicants treated almost like employed
-#   ones. It reaches about 95% of the gain any model could achieve on this data.
+#   ones. It captures 91% of the gain any model could achieve on this data.
 # - **Against the patched rules, the gain is smaller but consistent:** AUC +0.021 (better in 22 of 25
 #   folds). The two are level at today's approval cutoff (128 vs 124 defaults let through), and the
 #   model catches 12 more defaults while wrongly denying 12 fewer good applicants in the deny tier. It
 #   also produces calibrated probabilities, which the rules can't. Those are what make "approve 140
 #   more at the same default rate" possible, and they can be re-calibrated when conditions change
-#   (section 8).
+#   (README, section 5).
 # - **Recommendation:** replace the rules with the model, starting in shadow mode. If something has to
 #   ship before the model is approved, the two-line rules patch delivers most of the fairness gain and
 #   part of the accuracy gain immediately.
@@ -1267,7 +1291,7 @@ levels = {
 }
 fig, axes = plt.subplots(2, 3, figsize=(11.5, 6.2))
 effect_axes = list(axes[0]) + list(axes[1][:2])
-for ax, column in zip(axes[0], grids):
+for ax, column in zip(axes[0], grids, strict=True):
     grid = grids[column]
     ax.plot(grid, true_effect[column](grid) - truth_offset[column], color=plots.INK_SECONDARY, linewidth=1,
             label="generator's true effect")
@@ -1279,7 +1303,7 @@ axes[0][0].minorticks_off()
 plots.dollar_axis(axes[0][1])
 plots.percent_axis(axes[0][2], "x")
 axes[0][0].legend(loc="upper left", fontsize=8)
-for ax, (column, (values, labels)) in zip(axes[1], levels.items()):
+for ax, (column, (values, labels)) in zip(axes[1][:2], levels.items(), strict=True):
     x = np.arange(len(values))
     ax.scatter(x - 0.08, true_effect[column](values) - truth_offset[column], s=50, color=plots.INK_SECONDARY, zorder=3)
     ax.scatter(x + 0.08, explainer.effect(column, values), s=60, color=plots.MODEL_COLOR, edgecolor=plots.SURFACE,
@@ -1316,7 +1340,7 @@ for column, (values, labels) in levels.items():
     effect = explainer.effect(column, values)
     truth = true_effect[column](values) - truth_offset[column]
     print(f"{FEATURE_LABELS[column]}: " + ", ".join(
-        f"{label} {learned:+.2f} (true {true:+.2f})" for label, learned, true in zip(labels, effect, truth)))
+        f"{label} {learned:+.2f} (true {true:+.2f})" for label, learned, true in zip(labels, effect, truth, strict=True)))
 
 # %% [markdown]
 # **The strong effects are recovered precisely, the weak ones only roughly.**
@@ -1331,16 +1355,52 @@ for column, (values, labels) in levels.items():
 #   instead of $500) and there is an extra one near $4,400.
 # - **Withdrawals ÷ deposits:** rises above about 80% as it should. It also has one artifact:
 #   applicants withdrawing under 34% of their deposits get a large risk reduction (-0.66) that the true
-#   process doesn't have. About 80 training loans in that range happened to default less.
+#   process doesn't have. The check below shows where it comes from.
 #
-# I tested two fixes. Requiring at least 100 loans per leaf removes the pocket at no cost in accuracy
-# (cross-validated log-loss 0.5338 vs 0.5341). But then a cross-validation training fold can no
-# longer single out a group as small as the unemployed (about 90 applicants), which the employment
-# comparisons need. Bagging (averaging 10 models fitted to resampled data) didn't remove it. A pocket
-# of 80 noisy loans and a real group of 90 look the same to any regularizer; only more data separates
-# them. So the artifact is disclosed rather than tuned away, and it's the first thing I'd revisit with
-# more data. The weak features are also why only contributions of at least 0.10 log-odds are given as
-# reasons.
+# **Can the artifact be tuned away?** The obvious fix is bigger leaves: requiring at least 100 loans
+# per leaf stops the model carving out small pockets. The check compares that with the selected
+# setting, for the working model (V3) and for the version with an unemployed flag (V2).
+
+# %%
+dev_tree = dev(core_tree)
+low_withdrawals = (dev_tree["withdrawal_to_deposit"] < 0.34).to_numpy()
+print(f"Development loans withdrawing under 34% of deposits: {low_withdrawals.sum()}, of whom "
+      f"{y_dev[low_withdrawals].mean():.0%} defaulted (all development loans: {y_dev.mean():.0%})")
+bigger_leaves = partial(make_additive_gbm, **{**ADDITIVE_GBM_PARAMS, "min_samples_leaf": 100})
+smoothing = {
+    "V3, 50 per leaf (selected)": selected_cv,
+    "V3, 100 per leaf": cross_validate(bigger_leaves, dev_tree, y_dev, splits),
+    "V2, 50 per leaf": variant_cv["V2"],
+    "V2, 100 per leaf": cross_validate(bigger_leaves, dev(tree_matrix(features, "V2")), y_dev, splits),
+}
+display(summarize({name: result.fold_metrics for name, result in smoothing.items()})
+        [["ROC-AUC", "log-loss", "log-loss se"]].round(4))
+for name, factory in [("50 per leaf", make_production_model), ("100 per leaf", bigger_leaves)]:
+    effect = AdditiveExplainer(factory(dev_tree.columns).fit(dev_tree, y_dev), dev_tree).effect(
+        "withdrawal_to_deposit", grids["withdrawal_to_deposit"])
+    step = int(np.argmax(np.abs(np.diff(effect))))
+    print(f"Withdrawals effect with {name}: total range {np.ptp(effect):.2f} log-odds, largest step at "
+          f"{grids['withdrawal_to_deposit'][step]:.0%} (true effect: one step of 0.5 at 80%)")
+unemployed_dev = resolved["employment_status"].to_numpy()[train_rows] == "unemployed"
+per_fold = [int(unemployed_dev[train].sum()) for _, train, _ in splits]
+flag_effect = np.abs(smoothing["V2, 100 per leaf"].oof - smoothing["V3, 100 per leaf"].oof).max()
+print(f"With 100 per leaf, adding the unemployed flag changes predictions by at most {flag_effect:.1e}. "
+      f"Training folds hold {min(per_fold)}-{max(per_fold)} unemployed applicants, and early stopping sets 15% "
+      "of those aside, so the flag can't form a leaf of 100.")
+
+# %% [markdown]
+# - **The artifact is noise.** 82 development loans withdraw under 34% of their deposits, and 21% of
+#   them defaulted against 30% overall. The true process gives them no advantage, so that gap is luck,
+#   and the model learned it.
+# - **Bigger leaves remove it at no cost in accuracy:** log-loss 0.5338 against 0.5341, and the
+#   withdrawal effect shrinks to a range of 0.81 with its largest step at 84%, close to the true 80%.
+# - **But they also blind the model to small groups.** With 100 loans per leaf, adding the unemployed
+#   flag changes no prediction at all. A training fold holds only 100-114 unemployed applicants and
+#   early stopping sets 15% aside, so the flag can never form a leaf. The employment comparisons in
+#   sections 4.4 and 7 need that flag to be usable. A pocket of about 80 lucky loans and a real group
+#   of about 90 look the same to any regularizer; only more data separates them.
+# - **So I keep the selected setting and disclose the artifact.** It's the first thing I'd revisit with
+#   more data, and it's why only contributions of at least 0.10 log-odds are given as reasons.
 
 # %% [markdown]
 # ### 6.3 All applicants at once
@@ -1431,7 +1491,7 @@ def short_label(column: str, value) -> str:
 
 
 fig, axes = plt.subplots(2, 2, figsize=(11.5, 5.8), sharex=True)
-for ax, (label, applicant_id) in zip(axes.ravel(), examples.items()):
+for ax, (label, applicant_id) in zip(axes.ravel(), examples.items(), strict=True):
     position = int(np.flatnonzero(resolved["applicant_id"].to_numpy() == applicant_id)[0])
     row = core_tree.iloc[[position]]
     probability, reasons = explainer.explain(row)
@@ -1560,8 +1620,8 @@ measures = {
 }
 fig, axes = plt.subplots(1, 3, figsize=(12, 3.6), sharey=True)
 rows = np.arange(len(EMPLOYMENT_GROUPS))[::-1]
-for ax, (column, title) in zip(axes, measures.items()):
-    for offset, (name, (color, marker)) in zip(np.linspace(0.24, -0.24, len(markers)), markers.items()):
+for ax, (column, title) in zip(axes, measures.items(), strict=True):
+    for offset, (name, (color, marker)) in zip(np.linspace(0.24, -0.24, len(markers)), markers.items(), strict=True):
         values = group_tables[name].loc[EMPLOYMENT_GROUPS, column].to_numpy()
         hollow = marker == "D"
         ax.scatter(values, rows + offset, s=46, marker=marker, color="none" if hollow else color,
@@ -1638,6 +1698,7 @@ for name in ["Model, all three groups (V1)", "Model + unemployed flag (V2)", "Mo
         "ROC-AUC": roc_auc_score(y, p),
         "log-loss": probability_metrics(y, p)["log-loss"],
         "defaults auto-approved": int(y[tiers == "approve"].sum()),
+        "defaults denied": int(y[tiers == "deny"].sum()),
         "good applicants denied": int((1 - y)[tiers == "deny"].sum()),
         "self-employed approval ratio": group_tables[name].loc["self_employed", "approval ratio"],
         "unemployed approval ratio": group_tables[name].loc["unemployed", "approval ratio"],
@@ -1689,11 +1750,12 @@ display(all_contributions.groupby(employment).mean().reindex(EMPLOYMENT_GROUPS)
         .rename(index=GROUP_LABELS, columns=FEATURE_LABELS).round(2))
 
 # %% [markdown]
-# - **Unemployment is easy to infer from the model's inputs** (AUC 0.82-0.86), mainly through income
-#   and loan ÷ income. Dropping the employment column doesn't stop the model reacting to unemployment.
-#   It reacts through proxies, and less accurately, which is the miscalibration in section 7.3. On
-#   average, unemployed applicants' loan ÷ income contribution is far higher than other groups', so
-#   affordability already carries most of their extra risk.
+# - **Unemployment is easy to infer from the model's inputs** (AUC 0.82-0.86), mainly through loan ÷
+#   income, whose denominator is the applicant's (often low) income. So dropping the employment column
+#   doesn't stop the model reacting to unemployment. It reacts through proxies, and less accurately,
+#   which is the miscalibration in section 7.3. On average, unemployed applicants' loan ÷ income
+#   contribution is far higher than other groups', so affordability already carries most of their
+#   extra risk.
 # - **Self-employment is not inferable from the inputs** (AUC 0.51-0.54, close to chance). So the model
 #   can't penalize self-employed applicants indirectly either.
 # - **Deposit consistency would have been a proxy** (AUC 0.69 on its own) while carrying no risk

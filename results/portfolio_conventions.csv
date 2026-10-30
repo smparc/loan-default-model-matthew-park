@@ -1,0 +1,9 @@
+,,TP,FP,FN,TN,precision,recall,F1,FPR,FNR
+Rules as they are,A: only deny = predicted default,143,122,402,1169,0.5396,0.2624,0.3531,0.0945,0.7376
+Rules as they are,B: not auto-approved = predicted default,404,581,141,710,0.4102,0.7413,0.5281,0.45,0.2587
+Patched rules (patch 2),A: only deny = predicted default,155,110,390,1181,0.5849,0.2844,0.3827,0.0852,0.7156
+Patched rules (patch 2),B: not auto-approved = predicted default,421,564,124,727,0.4274,0.7725,0.5503,0.4369,0.2275
+Model,A: only deny = predicted default,167,98,378,1193,0.6302,0.3064,0.4123,0.0759,0.6936
+Model,B: not auto-approved = predicted default,417,568,128,723,0.4234,0.7651,0.5451,0.44,0.2349
+"Oracle (ceiling, diagnostic only)",A: only deny = predicted default,170,95,375,1196,0.6415,0.3119,0.4198,0.0736,0.6881
+"Oracle (ceiling, diagnostic only)",B: not auto-approved = predicted default,422,563,123,728,0.4284,0.7743,0.5516,0.4361,0.2257
